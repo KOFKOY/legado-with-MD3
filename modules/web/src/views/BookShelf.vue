@@ -55,6 +55,16 @@
               {{ connectStatus }}
             </el-tag>
           </div>
+          <div class="setting-item">
+            <el-tag
+              type="info"
+              size="large"
+              class="setting-connect"
+              @click="setLegadoWebsocketUrl"
+            >
+              {{ customWebsocketUrl ? 'WSS地址（已设置）' : 'WSS地址（默认）' }}
+            </el-tag>
+          </div>
         </div>
       </div>
       <div class="bottom-icons">
@@ -85,9 +95,13 @@ import { useBookStore } from '@/store'
 import githubUrl from '@/assets/imgs/github.png'
 import { useLoading } from '@/hooks/loading'
 import { Search as SearchIcon } from '@element-plus/icons-vue'
-import { baseURL_localStorage_key } from '@/api/axios'
+import {
+  baseURL_localStorage_key,
+  websocketURL_localStorage_key,
+} from '@/api/axios'
 import API, {
   legado_http_entry_point,
+  legado_webSocket_entry_point,
   parseLeagdoHttpUrlWithDefault,
   setApiEntryPoint,
 } from '@api'
@@ -177,6 +191,9 @@ const searchBook = () => {
 //连接状态
 const connectionStore = useConnectionStore()
 const { connectStatus, connectType, newConnect } = storeToRefs(connectionStore)
+const customWebsocketUrl = ref(
+  localStorage.getItem(websocketURL_localStorage_key) || '',
+)
 
 const setLegadoRetmoteUrl = () => {
   ElMessageBox.prompt(
@@ -216,6 +233,44 @@ const setLegadoRetmoteUrl = () => {
               instance.confirmButtonText = '确定'
               throw error
             })
+        } else {
+          done()
+        }
+      },
+    },
+  )
+}
+
+const setLegadoWebsocketUrl = () => {
+  ElMessageBox.prompt(
+    '请输入 WebSocket 地址（支持 ws:// 或 wss://，留空使用默认地址）',
+    '设置 WSS 地址',
+    {
+      confirmButtonText: '保存',
+      cancelButtonText: '取消',
+      inputValue: customWebsocketUrl.value,
+      inputPlaceholder: legado_webSocket_entry_point,
+      inputValidator: value =>
+        value.trim() === '' || validatorHttpUrl(value, ['wss:', 'ws:']),
+      inputErrorMessage: '请输入有效的 ws:// 或 wss:// 地址',
+      beforeClose: (action, instance, done) => {
+        if (action === 'confirm') {
+          const url = instance.inputValue.trim()
+          if (url === '') {
+            customWebsocketUrl.value = ''
+            localStorage.removeItem(websocketURL_localStorage_key)
+          } else {
+            customWebsocketUrl.value = new URL(url).toString()
+            localStorage.setItem(
+              websocketURL_localStorage_key,
+              customWebsocketUrl.value,
+            )
+          }
+          setApiEntryPoint(
+            ...parseLeagdoHttpUrlWithDefault(legado_http_entry_point),
+          )
+          ElMessage.success('WSS 地址已生效')
+          done()
         } else {
           done()
         }

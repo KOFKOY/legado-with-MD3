@@ -6,7 +6,7 @@ import API, {
   legado_http_entry_point,
   setWebsocketOnMessage,
 } from './api'
-import ajax from './axios'
+import ajax, { websocketURL_localStorage_key } from './axios'
 import { validatorHttpUrl } from '@/utils/utils'
 
 import { createApp } from 'vue'
@@ -71,6 +71,7 @@ setWebsocketOnMessage(() => {
  */
 export const parseLeagdoHttpUrlWithDefault = (
   http_url: string | URL,
+  websocket_url = localStorage.getItem(websocketURL_localStorage_key),
 ): [string, string] => {
   let url = new URL(location.origin) //默认当前网址的origin部分
   if (validatorHttpUrl(http_url)) {
@@ -84,16 +85,20 @@ export const parseLeagdoHttpUrlWithDefault = (
   } else {
     legado_webSocket_port = protocol.startsWith('https:') ? '444' : '81'
   }
-  // websocket协议是否为加密版本
-  const legado_webSocket_protocol = protocol.startsWith('https:')
-    ? 'wss://'
-    : 'ws://'
-
   const http_entry_point = url.toString()
 
-  url.protocol = legado_webSocket_protocol
-  url.port = legado_webSocket_port
-  const webSocket_entry_point = url.toString()
+  let webSocket_entry_point: string
+  if (websocket_url && validatorHttpUrl(websocket_url, ['wss:', 'ws:'])) {
+    webSocket_entry_point = new URL(websocket_url).toString()
+  } else {
+    // websocket协议是否为加密版本
+    const legado_webSocket_protocol = protocol.startsWith('https:')
+      ? 'wss://'
+      : 'ws://'
+    url.protocol = legado_webSocket_protocol
+    url.port = legado_webSocket_port
+    webSocket_entry_point = url.toString()
+  }
 
   console.info('legado_api_config:')
   console.table({
