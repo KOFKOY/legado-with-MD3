@@ -1,5 +1,5 @@
 name: Build Web + APK
-run-name: Build Web + APK · ${{ github.ref_name }} · ${{ github.run_number }}
+run-name: Build Web + APK · Release arm64-v8a · ${{ github.ref_name }} · ${{ github.run_number }}
 
 on:
   push:
@@ -34,9 +34,26 @@ jobs:
         run: |
           SAFE_BRANCH=$(printf '%s' "$GITHUB_REF_NAME" | LC_ALL=C sed 's/[^a-zA-Z0-9._-]/_/g' | cut -c1-80)
           SHORT_SHA=$(git rev-parse --short=10 HEAD)
-          echo "artifact_name=legado-${SAFE_BRANCH}-${SHORT_SHA}-${GITHUB_RUN_NUMBER}-${GITHUB_RUN_ATTEMPT}" >> "$GITHUB_OUTPUT"
+          echo "artifact_name=legado-release-arm64-v8a-${SAFE_BRANCH}-${SHORT_SHA}-${GITHUB_RUN_NUMBER}-${GITHUB_RUN_ATTEMPT}" >> "$GITHUB_OUTPUT"
           echo "COMMIT_NUMBER=$(git rev-list --count HEAD)" >> "$GITHUB_ENV"
           echo "APP_VERSION_NAME=web-${GITHUB_RUN_NUMBER}-${SHORT_SHA}" >> "$GITHUB_ENV"
+
+      # 复用现有发布流程的签名配置，缺失时立即失败，避免上传未签名 APK。
+      - name: Prepare Release signing
+        env:
+          SIGNING_KEY: ${{ secrets.SIGNING_KEY }}
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+        run: |
+          for name in SIGNING_KEY KEYSTORE_PASSWORD KEY_ALIAS KEY_PASSWORD; do
+            if [[ -z "${!name}" ]]; then
+              echo "::error::缺少仓库 Secret：${name}，请配置 Release 签名。"
+              exit 1
+            fi
+          done
+          printf '%s' "$SIGNING_KEY" | base64 --decode > "$RUNNER_TEMP/legado-release.jks"
+          test -s "$RUNNER_TEMP/legado-release.jks"
 
       - name: Install pnpm
         uses: pnpm/action-setup@v4
@@ -81,29 +98,51 @@ jobs:
           sed -i '/maven.aliyun.com/d' settings.gradle
           chmod +x gradlew
 
-      - name: Build universal Debug APK
-        run: ./gradlew assembleAppDebug -PenableAbiSplits=false --no-daemon --no-configuration-cache
+      - name: Build arm64-v8a Release APK
+        env:
+          ORG_GRADLE_PROJECT_RELEASE_STORE_FILE: ${{ runner.temp }}/legado-release.jks
+          ORG_GRADLE_PROJECT_RELEASE_STORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          ORG_GRADLE_PROJECT_RELEASE_KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          ORG_GRADLE_PROJECT_RELEASE_KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+        run: ./gradlew assembleAppRelease -PenableAbiSplits=true -PtargetAbi=arm64-v8a --no-daemon --no-configuration-cache
 
       - name: Prepare APK artifact
         env:
           ARTIFACT_NAME: ${{ steps.metadata.outputs.artifact_name }}
         run: |
           shopt -s nullglob
-          APK_FILES=(app/build/outputs/apk/app/debug/*.apk)
+          APK_FILES=(app/build/outputs/apk/app/release/*.apk)
           if [[ ${#APK_FILES[@]} -ne 1 ]]; then
-            echo "::error::预期生成 1 个通用 APK，实际生成 ${#APK_FILES[@]} 个。"
+            echo "::error::预期生成 1 个 arm64-v8a Release APK，实际生成 ${#APK_FILES[@]} 个。"
             exit 1
           fi
-          mv -- "${APK_FILES[0]}" "app/build/outputs/apk/app/debug/${ARTIFACT_NAME}-universal.apk"
+          if [[ "${APK_FILES[0]}" == *-unsigned.apk ]]; then
+            echo "::error::Release APK 未签名。"
+            exit 1
+          fi
+          APK_ABIS=$(unzip -Z1 "${APK_FILES[0]}" | awk -F/ '$1 == "lib" && NF >= 3 {print $2}' | sort -u)
+          if [[ "$APK_ABIS" != "arm64-v8a" ]]; then
+            echo "::error::APK 原生库架构不符合 arm64-v8a 单架构要求。"
+            exit 1
+          fi
+          mv -- "${APK_FILES[0]}" "app/build/outputs/apk/app/release/${ARTIFACT_NAME}.apk"
+          du -h "app/build/outputs/apk/app/release/${ARTIFACT_NAME}.apk"
 
       - name: Upload APK
         id: upload
         uses: actions/upload-artifact@v4
         with:
           name: ${{ steps.metadata.outputs.artifact_name }}
-          path: app/build/outputs/apk/app/debug/*.apk
+          path: app/build/outputs/apk/app/release/*.apk
           if-no-files-found: error
           compression-level: 0
+
+      - name: Upload R8 mapping
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.metadata.outputs.artifact_name }}-mapping
+          path: app/build/outputs/mapping/appRelease/mapping.txt
+          if-no-files-found: error
 
       - name: Write build summary
         env:
@@ -112,6 +151,6 @@ jobs:
           {
             printf '分支：`%s`\n\n' "$GITHUB_REF_NAME"
             printf '提交：`%s`\n\n' "$GITHUB_SHA"
-            printf '已从本次源码构建 Web 并同步到 APK，产物为 Debug 通用版。\n\n'
+            printf '已从本次源码构建 Web 并同步到 APK，产物为已签名的 Release arm64-v8a，启用 R8 和资源压缩。\n\n'
             printf '[下载 APK 产物](%s)\n' "$ARTIFACT_URL"
           } >> "$GITHUB_STEP_SUMMARY"

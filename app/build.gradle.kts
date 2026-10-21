@@ -30,6 +30,13 @@ val projectVersionName = "$versionMajor.$versionMinor.$versionPatch"
 val enableAbiSplits = providers.gradleProperty("enableAbiSplits")
     .map(String::toBoolean)
     .getOrElse(true)
+val targetAbi = providers.gradleProperty("targetAbi").orNull
+require(targetAbi == null || targetAbi in setOf("armeabi-v7a", "arm64-v8a")) {
+    "targetAbi 仅支持 armeabi-v7a 或 arm64-v8a"
+}
+require(targetAbi == null || enableAbiSplits) {
+    "指定 targetAbi 时必须启用 enableAbiSplits"
+}
 
 android {
     // Compose 1.13.0-beta01 的 AAR 元数据要求 compileSdk >= 37.1（android-37.0 会被 checkAarMetadata 拒绝）。
@@ -125,8 +132,13 @@ android {
         abi {
             isEnable = enableAbiSplits
             reset()
-            include("armeabi-v7a", "arm64-v8a")
-            isUniversalApk = true
+            val requestedAbi = targetAbi
+            if (requestedAbi != null) {
+                include(requestedAbi)
+            } else {
+                include("armeabi-v7a", "arm64-v8a")
+            }
+            isUniversalApk = targetAbi == null
         }
     }
 
