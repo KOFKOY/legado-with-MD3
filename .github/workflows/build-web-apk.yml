@@ -1,0 +1,117 @@
+name: Build Web + APK
+run-name: Build Web + APK · ${{ github.ref_name }} · ${{ github.run_number }}
+
+on:
+  push:
+    branches:
+      - '**'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-web-apk-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - name: Checkout triggering commit
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Prepare build metadata
+        id: metadata
+        run: |
+          SAFE_BRANCH=$(printf '%s' "$GITHUB_REF_NAME" | LC_ALL=C sed 's/[^a-zA-Z0-9._-]/_/g' | cut -c1-80)
+          SHORT_SHA=$(git rev-parse --short=10 HEAD)
+          echo "artifact_name=legado-${SAFE_BRANCH}-${SHORT_SHA}-${GITHUB_RUN_NUMBER}-${GITHUB_RUN_ATTEMPT}" >> "$GITHUB_OUTPUT"
+          echo "COMMIT_NUMBER=$(git rev-list --count HEAD)" >> "$GITHUB_ENV"
+          echo "APP_VERSION_NAME=web-${GITHUB_RUN_NUMBER}-${SHORT_SHA}" >> "$GITHUB_ENV"
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 9
+          run_install: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: modules/web/pnpm-lock.yaml
+
+      - name: Install Web dependencies
+        working-directory: modules/web
+        run: pnpm install --frozen-lockfile
+
+      # build 包含类型检查、Vite 构建和 sync.js；Actions 中会自动同步到 Android assets。
+      - name: Build Web and sync Android assets
+        working-directory: modules/web
+        run: pnpm build
+
+      - name: Verify Web assets
+        run: |
+          test -s modules/web/dist/index.html
+          diff -qr modules/web/dist app/src/main/assets/web/vue
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: 21
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      # 与现有 APK 工作流保持一致，避开 CI 中不稳定的镜像并清空内置过滤列表。
+      - name: Prepare Android build
+        run: |
+          printf '\n' > app/src/main/assets/18PlusList.txt
+          sed -i '/maven.aliyun.com/d' settings.gradle
+          chmod +x gradlew
+
+      - name: Build universal Debug APK
+        run: ./gradlew assembleAppDebug -PenableAbiSplits=false --no-daemon --no-configuration-cache
+
+      - name: Prepare APK artifact
+        env:
+          ARTIFACT_NAME: ${{ steps.metadata.outputs.artifact_name }}
+        run: |
+          shopt -s nullglob
+          APK_FILES=(app/build/outputs/apk/app/debug/*.apk)
+          if [[ ${#APK_FILES[@]} -ne 1 ]]; then
+            echo "::error::预期生成 1 个通用 APK，实际生成 ${#APK_FILES[@]} 个。"
+            exit 1
+          fi
+          mv -- "${APK_FILES[0]}" "app/build/outputs/apk/app/debug/${ARTIFACT_NAME}-universal.apk"
+
+      - name: Upload APK
+        id: upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.metadata.outputs.artifact_name }}
+          path: app/build/outputs/apk/app/debug/*.apk
+          if-no-files-found: error
+          compression-level: 0
+
+      - name: Write build summary
+        env:
+          ARTIFACT_URL: ${{ steps.upload.outputs.artifact-url }}
+        run: |
+          {
+            printf '分支：`%s`\n\n' "$GITHUB_REF_NAME"
+            printf '提交：`%s`\n\n' "$GITHUB_SHA"
+            printf '已从本次源码构建 Web 并同步到 APK，产物为 Debug 通用版。\n\n'
+            printf '[下载 APK 产物](%s)\n' "$ARTIFACT_URL"
+          } >> "$GITHUB_STEP_SUMMARY"

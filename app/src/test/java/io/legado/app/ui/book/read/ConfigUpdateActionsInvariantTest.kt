@@ -88,6 +88,14 @@ class ConfigUpdateActionsInvariantTest {
             // 阅读菜单外观
             "MenuTextColor",
             "MenuTextColorNight",
+            // 菜单强调色/容器色与菜单栏边框只被菜单读取（menuConfig 状态驱动），无正文副作用
+            "MenuAccentColor",
+            "MenuAccentColorNight",
+            "MenuContainerColor",
+            "MenuContainerColorNight",
+            "BorderWidth",
+            "BorderColor",
+            "BorderColorNight",
             "MenuIconShowText",
             "MenuIconStyle",
             "MenuIconItemsPerRow",
@@ -128,6 +136,7 @@ class ConfigUpdateActionsInvariantTest {
             "MouseWheelPage",
             "VolumeKeyPage",
             "VolumeKeyPageOnPlay",
+            "ReadAloudDetachReminderEnabled",
             "KeyPageOnLongPress",
             "SwipeToAddBookmark",
             "BookmarkBadgeSize",
@@ -151,6 +160,12 @@ class ConfigUpdateActionsInvariantTest {
             "UseNewTocSheet",
             // 只影响下次目录解析时的无规则章节切分长度，取用时读设置，无渲染副作用
             "MaxLengthWithNoToc",
+            // 只写 DataStore 的 readingAnchorEnabled，锚点栏可见性由 readPreferences 反应式驱动
+            "ReadingAnchorEnabled",
+            // 翻页速度挡位只改翻页动画的折算基准时长，下一次翻页现读挡位；不改变动画种类、
+            // 页高或排版，因此没有需要命令式驱动的渲染副作用。它写的是排版配置而非 DataStore，
+            // 快照经 `ReadStyleGateway.publishState` 反应式刷新，故同样落在这里。
+            "PageAnimSpeed",
         )
     }
 }

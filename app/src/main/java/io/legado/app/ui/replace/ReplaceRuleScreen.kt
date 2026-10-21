@@ -3,7 +3,6 @@ package io.legado.app.ui.replace
 import android.content.ClipData
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
-import androidx.appcompat.app.AppCompatActivity
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -59,7 +58,6 @@ import io.legado.app.ui.widget.components.lazylist.FastScrollLazyColumn
 import io.legado.app.ui.widget.components.menuItem.RoundDropdownMenuItem
 import io.legado.app.ui.widget.components.rules.RuleListScaffold
 import io.legado.app.ui.widget.components.tabRow.AppTabRow
-import io.legado.app.utils.showHelp
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.launch
 import org.koin.androidx.compose.koinViewModel
@@ -273,7 +271,8 @@ fun ReplaceRuleScreen(
         groups = groups,
         onDismissRequest = { showGroupManageSheet = false },
         onUpdateGroup = { old, new -> onIntent(ReplaceRuleIntent.UpGroup(old, new)) },
-        onDeleteGroup = { onIntent(ReplaceRuleIntent.DeleteGroup(it)) }
+        onDeleteGroup = { onIntent(ReplaceRuleIntent.DeleteGroup(it)) },
+        onDeleteGroups = { onIntent(ReplaceRuleIntent.DeleteGroups(it)) }
     )
 
 
@@ -281,6 +280,7 @@ fun ReplaceRuleScreen(
         data = showDeleteRuleDialog,
         onDismissRequest = { showDeleteRuleDialog = null },
         title = stringResource(R.string.delete),
+        text = stringResource(R.string.sure_del),
         confirmText = stringResource(R.string.ok),
         onConfirm = { rule ->
             onIntent(ReplaceRuleIntent.DeleteRule(rule))
@@ -362,10 +362,6 @@ fun ReplaceRuleScreen(
             RoundDropdownMenuItem(
                 text = stringResource(R.string.group_management),
                 onClick = { showGroupManageSheet = true; dismiss() }
-            )
-            RoundDropdownMenuItem(
-                text = stringResource(R.string.help),
-                onClick = { dismiss(); (context as? AppCompatActivity)?.showHelp("replaceRuleHelp") }
             )
             PillDivider()
             RoundDropdownMenuItem(

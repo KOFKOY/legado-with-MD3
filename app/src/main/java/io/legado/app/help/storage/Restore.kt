@@ -4,9 +4,9 @@ import android.content.Context
 import android.database.sqlite.SQLiteConstraintException
 import android.net.Uri
 import android.os.Environment
-import androidx.room.withTransaction
 import androidx.core.net.toUri
 import androidx.documentfile.provider.DocumentFile
+import androidx.room.withTransaction
 import io.legado.app.BuildConfig
 import io.legado.app.R
 import io.legado.app.constant.AppLog
@@ -14,6 +14,7 @@ import io.legado.app.constant.PreferKey
 import io.legado.app.data.appDb
 import io.legado.app.data.entities.Book
 import io.legado.app.data.entities.BookGroup
+import io.legado.app.data.entities.BookMarking
 import io.legado.app.data.entities.BookSource
 import io.legado.app.data.entities.Bookmark
 import io.legado.app.data.entities.DictRule
@@ -33,16 +34,17 @@ import io.legado.app.data.entities.TagGroupRule
 import io.legado.app.data.entities.TxtTocRule
 import io.legado.app.data.entities.readRecord.ReadRecord
 import io.legado.app.data.entities.readRecord.ReadRecordDetail
-import io.legado.app.data.entities.readRecord.ReadRecordSession
 import io.legado.app.data.entities.readRecord.ReadRecordIdentity
+import io.legado.app.data.entities.readRecord.ReadRecordSession
 import io.legado.app.data.repository.ReadRecordRepository
 import io.legado.app.domain.gateway.AppLocaleGateway
 import io.legado.app.domain.gateway.ReadStyleGateway
-import io.legado.app.ui.book.read.ConfigUpdateAction
-import io.legado.app.ui.book.read.ReadConfigUpdateBus
+import io.legado.app.data.repository.HttpTtsRepository
+import io.legado.app.data.entities.ReadAloudVoiceEntity
 import io.legado.app.help.DirectLinkUpload
 import io.legado.app.help.LauncherIconHelp
 import io.legado.app.help.book.isLocal
+import io.legado.app.help.readaloud.speech.HttpTtsCatalogParser
 import io.legado.app.help.book.upType
 import io.legado.app.help.config.AppConfigStore
 import io.legado.app.help.config.LocalConfig
@@ -51,7 +53,8 @@ import io.legado.app.help.config.SettingsWriter
 import io.legado.app.help.config.ThemeConfigStore
 import io.legado.app.model.BookCover
 import io.legado.app.model.localBook.LocalBook
-import io.legado.app.ui.config.otherConfig.OtherConfig
+import io.legado.app.ui.book.read.ConfigUpdateAction
+import io.legado.app.ui.book.read.ReadConfigUpdateBus
 import io.legado.app.utils.ACache
 import io.legado.app.utils.FileUtils
 import io.legado.app.utils.GSON
@@ -149,10 +152,17 @@ object Restore : KoinComponent {
                 }
             }
         }
+        // 书签与划线/想法笔记（book_marks）视为一体，统一受既有 bookmark 忽略项控制
         if (BackupConfig.dbIsNotIgnored("bookmark")) {
             fileToListT<Bookmark>(path, "bookmark.json")?.let {
                 try {
                     appDb.bookmarkDao.insert(*it.toTypedArray())
+                } catch (_: SQLiteConstraintException) {
+                }
+            }
+            fileToListT<BookMarking>(path, "bookMarking.json")?.let {
+                try {
+                    appDb.bookMarkingDao.insert(*it.toTypedArray())
                 } catch (_: SQLiteConstraintException) {
                 }
             }
@@ -226,10 +236,7 @@ object Restore : KoinComponent {
         }
         if (BackupConfig.dbIsNotIgnored("httpTTS")) {
             fileToListT<HttpTTS>(path, "httpTTS.json")?.let {
-                try {
-                    appDb.httpTTSDao.insert(*it.toTypedArray())
-                } catch (_: SQLiteConstraintException) {
-                }
+                restoreHttpTtsCatalogs(path, "httpTTS.json", it)
             }
         }
         if (BackupConfig.dbIsNotIgnored("dictRule")) {
@@ -288,7 +295,7 @@ object Restore : KoinComponent {
             reconcileReadRecordAliases()
             // 会话导入按身份去重（幂等），汇总/明细取较大值后按会话重算，
             // 避免同一备份重复导入导致阅读时长翻倍。
-            get<ReadRecordRepository>().reconcileReadRecordTotalsFromSessions()
+            get<ReadRecordRepository>().reconcileRestoredReadRecordTotals()
         }
         if (BackupConfig.dbIsNotIgnored("server")) {
             File(path, "servers.json").takeIf {
@@ -356,7 +363,7 @@ object Restore : KoinComponent {
             get<ReadStyleGateway>().refresh()
             // refresh 只重建 Compose 侧 state；阅读器开着时渲染层的两份快照（RenderStyle/
             // TipStyle）与已排版内容不会跟着刷新，得走配置总线让 controller 重建并重排。
-            // 阅读器没开时无人消费，重开由 ReadView.init 的重建入口兜底。
+            // 阅读器没开时无人消费，重开后由 Compose 阅读路由的分页重建入口兜底。
             ReadConfigUpdateBus.post(
                 setOf(
                     ConfigUpdateAction.UpdateBackground,
@@ -382,7 +389,7 @@ object Restore : KoinComponent {
         appCtx.toastOnUi(R.string.restore_success)
         withContext(Main) {
             delay(100)
-            get<AppLocaleGateway>().setLanguage(OtherConfig.language)
+            get<AppLocaleGateway>().apply { setLanguage(currentLanguage) }
             if (!BuildConfig.DEBUG) {
                 LauncherIconHelp.changeIcon(appCtx.getPrefString(PreferKey.launcherIcon))
             }
@@ -469,6 +476,7 @@ object Restore : KoinComponent {
             localSession.deviceId,
             localSession.bookName,
             localSession.bookAuthor,
+            localSession.bookUrl,
             localSession.startTime,
             localSession.endTime,
             localSession.words
@@ -491,7 +499,7 @@ object Restore : KoinComponent {
                     .distinct()
                     .toList()
                 val author = authors.singleOrNull() ?: return@forEach
-                repository.mergeReadRecordInto(
+                repository.mergeIndependentReadRecordsInto(
                     targetRecord = ReadRecord(
                         deviceId = source.deviceId,
                         bookName = source.bookName,
@@ -553,6 +561,29 @@ object Restore : KoinComponent {
             e.printStackTrace()
         }
         return map
+    }
+
+    /**
+     * 恢复源自带的发言人 / 情绪目录。
+     *
+     * `speakersJson` / `emotionsJson` 不写回源行，目录的权威副本在 `read_aloud_voices`，
+     * 所以只能拿原始文本再解析一次——光看反序列化出来的实体拿不到这两个字段。
+     */
+    private suspend fun restoreHttpTtsCatalogs(
+        path: String,
+        fileName: String,
+        sources: List<HttpTTS>,
+    ) {
+        val file = File(path, fileName)
+        if (!file.exists()) return
+        val drafts = HttpTtsCatalogParser.parseList(file.readText())
+        require(drafts.size == sources.size) { "httpTTS 目录条数与源条数不一致" }
+        val voicesFile = File(path, "httpTtsVoices.json")
+        val voices = if (voicesFile.exists()) {
+            // 不能把损坏的新备份当成旧备份忽略，否则会静默丢失排除状态。
+            GSON.fromJsonArray<ReadAloudVoiceEntity>(voicesFile.readText()).getOrThrow()
+        } else null
+        get<HttpTtsRepository>().restore(sources.zip(drafts), voices)
     }
 
     private inline fun <reified T> fileToListT(path: String, fileName: String): List<T>? {

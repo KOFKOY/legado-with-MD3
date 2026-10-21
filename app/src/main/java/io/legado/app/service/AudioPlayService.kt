@@ -5,6 +5,7 @@ import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
+import android.content.res.Configuration
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.media.AudioManager
@@ -21,6 +22,7 @@ import androidx.lifecycle.lifecycleScope
 import androidx.media.AudioFocusRequestCompat
 import androidx.media3.common.PlaybackException
 import androidx.media3.common.Player
+import androidx.media3.common.util.UnstableApi
 import androidx.media3.exoplayer.ExoPlayer
 import io.legado.app.R
 import io.legado.app.base.BaseService
@@ -30,9 +32,13 @@ import io.legado.app.constant.EventBus
 import io.legado.app.constant.IntentAction
 import io.legado.app.constant.NotificationId
 import io.legado.app.constant.Status
+import io.legado.app.domain.gateway.OtherSettingsGateway
+import io.legado.app.domain.gateway.ReadAloudSettingsGateway
+import io.legado.app.domain.gateway.PlaybackCapsuleGateway
+import io.legado.app.domain.model.PlaybackCapsuleSource
+import io.legado.app.service.readaloud.ReadAloudOverlayWindow
 import io.legado.app.domain.model.PlaybackTimer
 import io.legado.app.help.MediaHelp
-import io.legado.app.help.config.AppConfig
 import io.legado.app.help.coroutine.Coroutine
 import io.legado.app.help.exoplayer.ExoPlayerHelper
 import io.legado.app.help.glide.ImageLoader
@@ -40,7 +46,6 @@ import io.legado.app.model.AudioPlay
 import io.legado.app.model.analyzeRule.AnalyzeUrl
 import io.legado.app.model.analyzeRule.AnalyzeUrl.Companion.getMediaItem
 import io.legado.app.receiver.MediaButtonReceiver
-import io.legado.app.ui.config.readConfig.ReadConfig
 import io.legado.app.ui.main.MainActivity
 import io.legado.app.utils.activityPendingIntent
 import io.legado.app.utils.postEvent
@@ -52,11 +57,13 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import org.koin.core.context.GlobalContext
 import splitties.init.appCtx
 import splitties.systemservices.audioManager
 import splitties.systemservices.notificationManager
 import splitties.systemservices.powerManager
 import splitties.systemservices.wifiManager
+import kotlin.time.Duration.Companion.milliseconds
 
 /**
  * 音频播放服务
@@ -94,7 +101,9 @@ class AudioPlayService : BaseService(),
         private const val APP_ACTION_TIMER = "Timer"
     }
 
-    private val useWakeLock = AppConfig.audioPlayUseWakeLock
+    private val otherSettingsGateway get() = GlobalContext.get().get<OtherSettingsGateway>()
+    private val aloudSettingsGateway get() = GlobalContext.get().get<ReadAloudSettingsGateway>()
+    private val useWakeLock = otherSettingsGateway.currentSettings.audioPlayUseWakeLock
     private val wakeLock by lazy {
         powerManager.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "legado:AudioPlayService")
             .apply {
@@ -125,9 +134,14 @@ class AudioPlayService : BaseService(),
     private var cover: Bitmap =
         BitmapFactory.decodeResource(appCtx.resources, R.drawable.ic_launcher)!!
 
+    private var capsuleOverlayWindow: ReadAloudOverlayWindow? = null
+
     override fun onCreate() {
         super.onCreate()
         isRun = true
+        GlobalContext.get().get<PlaybackCapsuleGateway>()
+            .setSessionAvailable(PlaybackCapsuleSource.AudioBook, true)
+        capsuleOverlayWindow = ReadAloudOverlayWindow(this, PlaybackCapsuleSource.AudioBook)
         exoPlayer.addListener(this)
         AudioPlay.registerService(this)
         initMediaSession()
@@ -194,7 +208,16 @@ class AudioPlayService : BaseService(),
         return super.onStartCommand(intent, flags, startId)
     }
 
+    override fun onConfigurationChanged(newConfig: Configuration) {
+        super.onConfigurationChanged(newConfig)
+        capsuleOverlayWindow?.onConfigurationChanged()
+    }
+
     override fun onDestroy() {
+        GlobalContext.get().get<PlaybackCapsuleGateway>()
+            .setSessionAvailable(PlaybackCapsuleSource.AudioBook, false)
+        capsuleOverlayWindow?.close()
+        capsuleOverlayWindow = null
         super.onDestroy()
         if (useWakeLock) {
             wakeLock.release()
@@ -457,7 +480,7 @@ class AudioPlayService : BaseService(),
                         AudioPlay.next()
                     }
                 }
-                delay(1000)
+                delay(1000.milliseconds)
             }
         }
     }
@@ -465,6 +488,7 @@ class AudioPlayService : BaseService(),
     /**
      * 应用音频增益（LoudnessEnhancer，单位 mB，范围 -6000..6000）
      */
+    @androidx.annotation.OptIn(UnstableApi::class)
     private fun applyGain(gain: Int) {
         try {
             if (gain == 0) {
@@ -512,7 +536,7 @@ class AudioPlayService : BaseService(),
     @SuppressLint("UnspecifiedImmutableFlag")
     private fun initMediaSession() {
         mediaSessionCompat = MediaSessionCompat(this, "readAloud")
-        if (ReadConfig.systemMediaControlCompatibilityChange) {
+        if (aloudSettingsGateway.currentSettings.systemMediaControlCompatibilityChange) {
             mediaSessionCompat?.setCallback(object : MediaSessionCompat.Callback() {
                 override fun onSeekTo(pos: Long) {
                     position = pos.toInt()
@@ -577,7 +601,7 @@ class AudioPlayService : BaseService(),
      * 音频焦点变化
      */
     override fun onAudioFocusChange(focusChange: Int) {
-        if (ReadConfig.ignoreAudioFocus) {
+        if (aloudSettingsGateway.currentSettings.ignoreAudioFocus) {
             AppLog.put("忽略音频焦点处理(有声)")
             return
         }
@@ -677,7 +701,7 @@ class AudioPlayService : BaseService(),
     private fun choiceMediaStyle(): androidx.media.app.NotificationCompat.MediaStyle {
         val mediaStyle = androidx.media.app.NotificationCompat.MediaStyle()
         mediaStyle.setShowActionsInCompactView(1,2,4)
-        if (ReadConfig.systemMediaControlCompatibilityChange) {
+        if (aloudSettingsGateway.currentSettings.systemMediaControlCompatibilityChange) {
             //fix #4090 android 14 can not show play control in lock screen
             mediaStyle.setMediaSession(mediaSessionCompat?.sessionToken)
         }
@@ -714,7 +738,7 @@ class AudioPlayService : BaseService(),
      * @return 音频焦点
      */
     private fun requestFocus(): Boolean {
-        if (ReadConfig.ignoreAudioFocus) {
+        if (aloudSettingsGateway.currentSettings.ignoreAudioFocus) {
             return true
         }
         return MediaHelp.requestFocus(mFocusRequest)

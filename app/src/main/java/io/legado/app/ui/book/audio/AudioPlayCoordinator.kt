@@ -6,6 +6,7 @@ import com.jeremyliao.liveeventbus.LiveEventBus
 import io.legado.app.constant.EventBus
 import io.legado.app.constant.Status
 import io.legado.app.data.repository.BookRepository
+import io.legado.app.domain.gateway.PlaybackCapsuleGateway
 import io.legado.app.domain.gateway.OtherSettingsGateway
 import io.legado.app.domain.gateway.ReadAloudSettingsGateway
 import io.legado.app.help.book.getBookSource
@@ -38,6 +39,7 @@ class AudioPlayCoordinator(
     private val bookRepository: BookRepository,
     private val otherSettingsGateway: OtherSettingsGateway,
     private val readAloudSettingsGateway: ReadAloudSettingsGateway,
+    private val playbackCapsuleGateway: PlaybackCapsuleGateway,
 ) {
     private val refreshRequests = MutableSharedFlow<Unit>(replay = 1)
     private val loading = MutableStateFlow(false)
@@ -98,6 +100,7 @@ class AudioPlayCoordinator(
             chapterIndex = book.chapterIndex,
             chapterTitle = book.chapterTitle,
             chapters = chapterList,
+            lyric = book.lyric,
             status = book.status,
             isLoading = isLoading,
             position = book.position,
@@ -127,6 +130,7 @@ class AudioPlayCoordinator(
             chapterIndex = book.chapterIndex,
             chapterTitle = book.chapterTitle,
             chapters = persistentListOf(),
+            lyric = book.lyric,
             status = book.status,
             isLoading = loading.value,
             position = book.position,
@@ -162,7 +166,12 @@ class AudioPlayCoordinator(
         }
     }
 
-    fun stop() = AudioPlay.stop()
+    fun prepareBook(bookUrl: String) = playbackCapsuleGateway.prepareAudioBook(bookUrl)
+
+    fun stop() {
+        AudioPlay.book?.bookUrl?.let(playbackCapsuleGateway::clearPreparedAudioBook)
+        AudioPlay.stop()
+    }
 
     fun previous() = AudioPlay.prev()
 
@@ -219,6 +228,8 @@ class AudioPlayCoordinator(
             sourceOrigin = book?.origin,
             chapterIndex = AudioPlay.durChapterIndex,
             chapterTitle = chapter?.title.orEmpty(),
+            lyric = chapter?.getVariable("lyric").takeIf { !it.isNullOrBlank() }
+                ?: AudioPlay.durLyric,
             status = AudioPlay.status,
             position = AudioPlay.durChapterPos,
             duration = AudioPlay.durAudioSize,
@@ -253,6 +264,7 @@ data class AudioPlaySourceState(
     val chapterIndex: Int,
     val chapterTitle: String,
     val chapters: ImmutableList<PlayerChapterUi>,
+    val lyric: String?,
     val status: Int,
     val isLoading: Boolean,
     val position: Int,
@@ -278,6 +290,7 @@ private data class AudioPlayBookState(
     val sourceOrigin: String?,
     val chapterIndex: Int,
     val chapterTitle: String,
+    val lyric: String?,
     val status: Int,
     val position: Int,
     val duration: Int,

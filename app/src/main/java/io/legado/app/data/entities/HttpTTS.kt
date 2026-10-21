@@ -7,6 +7,7 @@ import com.jayway.jsonpath.DocumentContext
 import io.legado.app.utils.GSON
 import io.legado.app.utils.jsonPath
 import io.legado.app.utils.readBool
+import io.legado.app.utils.readInt
 import io.legado.app.utils.readLong
 import io.legado.app.utils.readString
 
@@ -29,6 +30,19 @@ data class HttpTTS(
     @ColumnInfo(defaultValue = "0")
     override var enabledCookieJar: Boolean? = false,
     var loginCheckJs: String? = null,
+    /**
+     * 源级语速, 0..80, 实际倍速为 (speed + 5) / 10, null 时使用默认值 5 (1 倍速)。
+     * 仅当源接口支持语速参数 ({{speakSpeed}}) 时影响合成结果。
+     */
+    var speed: Int? = null,
+    /**
+     * 源自己声明的合成并发上限, 1..8。
+     *
+     * 外部源（含参考实现导出的 httpTTS.json）会带这个字段，导入时保留，
+     * 实时、试听、预合成及流式读取共用此源的配额；预合成另受全局任务上限约束。
+     */
+    @ColumnInfo(defaultValue = "1")
+    var synthesisThreadCount: Int = 1,
     @ColumnInfo(defaultValue = "0")
     var lastUpdateTime: Long = System.currentTimeMillis()
 ) : BaseSource {
@@ -43,6 +57,9 @@ data class HttpTTS(
 
     @Suppress("MemberVisibilityCanBePrivate")
     companion object {
+
+        /** 合成并发上限，与朗读设置里全局并发的取值范围一致。 */
+        const val MAX_SYNTHESIS_THREAD_COUNT = 8
 
         fun fromJsonDoc(doc: DocumentContext): Result<HttpTTS> {
             return kotlin.runCatching {
@@ -59,6 +76,9 @@ data class HttpTTS(
                     jsLib = doc.readString("$.jsLib"),
                     enabledCookieJar = doc.readBool("$.enabledCookieJar"),
                     loginCheckJs = doc.readString("$.loginCheckJs"),
+                    speed = doc.readInt("$.speed"),
+                    synthesisThreadCount = doc.readInt("$.synthesisThreadCount")
+                        ?.coerceIn(1, MAX_SYNTHESIS_THREAD_COUNT) ?: 1,
                     lastUpdateTime = doc.readLong("$.lastUpdateTime") ?: System.currentTimeMillis()
                 )
             }

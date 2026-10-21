@@ -18,6 +18,7 @@ import io.legado.app.domain.usecase.ChangeBookSourceUseCase
 import io.legado.app.domain.usecase.GetReadingProgressUseCase
 import io.legado.app.domain.usecase.UploadReadingProgressUseCase
 import io.legado.app.exception.NoStackTraceException
+import io.legado.app.feature.reader.platform.ReaderPerfTrace
 import io.legado.app.help.book.BookHelp
 import io.legado.app.help.book.isLocal
 import io.legado.app.help.book.isLocalModified
@@ -28,6 +29,7 @@ import io.legado.app.model.SourceCallBack
 import io.legado.app.model.localBook.LocalBook
 import io.legado.app.model.webBook.WebBook
 import io.legado.app.service.BaseReadAloudService
+import io.legado.app.model.ReadAloud
 import io.legado.app.utils.mapParallelSafe
 import io.legado.app.utils.postEvent
 import kotlinx.coroutines.CoroutineScope
@@ -41,6 +43,7 @@ import kotlinx.coroutines.flow.onEach
 import kotlinx.coroutines.flow.onEmpty
 import kotlinx.coroutines.flow.onStart
 import kotlinx.coroutines.flow.take
+import kotlinx.coroutines.withContext
 import java.io.FileNotFoundException
 import kotlin.coroutines.coroutineContext
 
@@ -50,8 +53,8 @@ import kotlin.coroutines.coroutineContext
  * 从导航请求解析出书，装载目录与正文，处理本地文件缺失、换源（手动与自动）、
  * 以及与云端阅读进度的双向同步。
  *
- * **无自持状态**：唯一的状态是 `isInitFinish`（ReadView 首帧靠它放行前后章排版，
- * 见 `prepareCachedChapterFallback` 的说明），必须留在 [ReadBookUiState]。
+ * **无自持状态**：唯一的状态是 `isInitFinish`（Compose 阅读路由用它表达开书初始化完成），
+ * 必须留在 [ReadBookUiState]。
  * 故与 [ReadConfigUpdateDelegate] 同形，读写经 [Host]。
  */
 class ReadBookLoadDelegate(
@@ -93,37 +96,49 @@ class ReadBookLoadDelegate(
 
     private var changeSourceCoroutine: Coroutine<*>? = null
 
-    suspend fun initReadBookConfig(request: ReadBookInitRequest) {
+    suspend fun initReadBookConfig(request: ReadBookInitRequest): Book? = withContext(Dispatchers.IO) {
         val bookUrl = request.bookUrl
         val book = when {
             bookUrl.isNullOrEmpty() -> bookRepository.getLastReadBook()
             else -> bookRepository.getBook(bookUrl)
-        } ?: return
+        } ?: return@withContext null
         ReadBook.upReadBookConfig(book)
+        book
     }
 
-    fun initData(request: ReadBookInitRequest, success: (() -> Unit)? = null) {
+    /**
+     * 开书流程。这里不写 `books` 行：`saveRead()` 会更新书架查询的投影列兼排序键
+     * `durChapterTime`，开页时再落一次会让整个书架重组。进度另有两处落库——翻页走
+     * `ReadBook.saveRead(pageChanged)`，离开页面走 `ReadBookViewModel.handleOnPause`。
+     */
+    fun initData(
+        request: ReadBookInitRequest,
+        initialBook: Book? = null,
+        success: (() -> Unit)? = null,
+    ) {
         Coroutine.async(scope, Dispatchers.IO) {
-            host.syncReadPreferencesSnapshot()
-            ReadBook.inBookshelf = request.inBookshelf
-            ReadBook.chapterChanged = request.chapterChanged
-            val bookUrl = request.bookUrl
-            val book = when {
-                bookUrl.isNullOrEmpty() -> bookRepository.getLastReadBook()
-                else -> bookRepository.getBook(bookUrl)
-            } ?: ReadBook.book
-            when {
-                book != null -> initBook(book)
-                else -> {
-                    ReadBook.upMsg(context.getString(R.string.no_book))
-                    AppLog.put("未找到书籍\nbookUrl:$bookUrl")
+            ReaderPerfTrace.suspendSection("open.init") {
+                host.syncReadPreferencesSnapshot()
+                ReadBook.inBookshelf = request.inBookshelf
+                ReadBook.chapterChanged = request.chapterChanged
+                val bookUrl = request.bookUrl
+                val book = initialBook ?: when {
+                    bookUrl.isNullOrEmpty() -> bookRepository.getLastReadBook()
+                    else -> bookRepository.getBook(bookUrl)
+                } ?: ReadBook.book
+                when {
+                    book != null -> initBook(book)
+                    else -> {
+                        ReadBook.upMsg(context.getString(R.string.no_book))
+                        AppLog.put("未找到书籍\nbookUrl:$bookUrl")
+                    }
                 }
-            }
-            val index = request.chapterIndex
-            val chapterPos = request.chapterPos
-            if (index >= 0 && chapterPos >= 0) {
-                ReadBook.saveCurrentBookProgress()
-                host.openChapter(index, chapterPos)
+                val index = request.chapterIndex
+                val chapterPos = request.chapterPos
+                if (index >= 0 && chapterPos >= 0) {
+                    ReadBook.saveCurrentBookProgress()
+                    host.openChapter(index, chapterPos)
+                }
             }
         }.onSuccess {
             success?.invoke()
@@ -131,40 +146,43 @@ class ReadBookLoadDelegate(
             val msg = "初始化数据失败\n${it.localizedMessage}"
             ReadBook.upMsg(msg)
             AppLog.put(msg, it)
-        }.onFinally {
-            ReadBook.saveRead()
         }
     }
 
     /** 换书/重装目录后重走开书流程。VM 的「模拟阅读切换」和目录权限回来后也调它。 */
-    suspend fun initBook(book: Book) {
+    suspend fun initBook(book: Book) = ReaderPerfTrace.suspendSection("open.book") {
         val isSameBook = ReadBook.book?.bookUrl == book.bookUrl
         if (isSameBook) {
             ReadBook.upData(book)
         } else {
-            ReadBook.resetData(book)
+            val playing = ReadAloud.bookSession.state.value
+            val readerBook = if (BaseReadAloudService.isRun && ReadAloud.bookSession.owns(book.bookUrl)) {
+                book.copy(durChapterIndex = playing.chapterIndex, durChapterPos = playing.chapterPosition)
+            } else book
+            ReadBook.resetData(readerBook)
         }
         host.setInitFinish()
         if (!book.isLocal && book.tocUrl.isEmpty() && !loadBookInfo(book)) {
-            return
+            return@suspendSection
         }
         if (book.isLocal && !checkLocalBookFileExist(book)) {
-            return
+            return@suspendSection
         }
         if ((ReadBook.chapterSize == 0 || book.isLocalModified()) && !loadChapterListAwait(book)) {
-            return
+            return@suspendSection
         }
         ReadBook.upMsg(null)
         host.checkReadRecordAlias(book)
 
         if (!isSameBook) {
-            ReadBook.loadContent(resetPageOffset = true) {
+            ReadBook.loadInitialContent(resetPageOffset = true,
+                preserveReadAloudPosition = ReadBook.isCurrentBookReadAloud) {
                 ReadBook.bookSource?.let {
                     SourceCallBack.callBackBook(
                         SourceCallBack.START_READ,
                         it,
                         book,
-                        ReadBook.curTextChapter?.chapter
+                        ReadBook.readerChapterInputWindow.current?.chapter
                     )
                 }
             }
@@ -175,14 +193,14 @@ class ReadBookLoadDelegate(
                         SourceCallBack.START_READ,
                         it,
                         book,
-                        ReadBook.curTextChapter?.chapter
+                        ReadBook.readerChapterInputWindow.current?.chapter
                     )
                 }
             }
         }
         if (ReadBook.chapterChanged) {
             ReadBook.chapterChanged = false
-        } else if (!(isSameBook && BaseReadAloudService.isRun) && ReadBook.inBookshelf) {
+        } else if (!ReadBook.isCurrentBookReadAloud && ReadBook.inBookshelf) {
             if (backupSettingsGateway.currentSettings.syncBookProgressPlus) {
                 ReadBook.syncProgress({ progress -> host.sureNewProgress(progress) })
             } else {
@@ -191,7 +209,7 @@ class ReadBookLoadDelegate(
         }
         if (!book.isLocal && ReadBook.bookSource == null) {
             autoChangeSource(book.name, book.author)
-            return
+            return@suspendSection
         }
     }
 
@@ -240,6 +258,11 @@ class ReadBookLoadDelegate(
             }.onFailure {
                 when (it) {
                     is SecurityException, is FileNotFoundException -> {
+                        // 只弹目录选择时阅读页会一直停在占位页、看不出原因；把失败原因也写成
+                        // 消息，用户重选目录并重载成功后由 initBook 的 upMsg(null) 清掉。
+                        ReadBook.upMsg(
+                            context.getString(R.string.error_load_msg, it.localizedMessage)
+                        )
                         host.requestBooksDirPicker(reloadChapterList = true)
                     }
                     else -> {

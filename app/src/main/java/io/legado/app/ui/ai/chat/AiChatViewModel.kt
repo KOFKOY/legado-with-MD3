@@ -292,7 +292,8 @@ class AiChatViewModel(
                 val shortTitle = generationUseCase.generateTitle(
                     userContent = userContent,
                     assistantContent = assistantContent,
-                    reasoningLevel = state.reasoningLevel
+                    reasoningLevel = state.reasoningLevel,
+                    conversationId = conversationId
                 )
                 if (shortTitle.isNotBlank()) {
                     aiChatGateway.updateConversationTitle(conversationId, shortTitle)
@@ -373,7 +374,7 @@ class AiChatViewModel(
                                 reasoning = fullReasoning.toString(),
                                 toolTrace = toolTrace
                             ),
-                            parentMessageId = message.parentMessageId!!,
+                            parentMessageId = message.parentMessageId,
                             thinkingDuration = duration
                         )
                     }
@@ -482,7 +483,7 @@ class AiChatViewModel(
                         )
                     }
                     // Generate AI title for first conversation
-                    if (conversationIdForMsg != null && historySnapshot.none { it.role == AiMessageRole.ASSISTANT }) {
+                    if (historySnapshot.none { it.role == AiMessageRole.ASSISTANT }) {
                         generateConversationTitle(conversationIdForMsg, content, assistantContent)
                     }
                 }

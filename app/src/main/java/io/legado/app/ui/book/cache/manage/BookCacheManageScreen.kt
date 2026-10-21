@@ -9,7 +9,6 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
-import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyListScope
 import androidx.compose.foundation.lazy.items
 import androidx.compose.material.icons.Icons
@@ -54,9 +53,11 @@ import io.legado.app.ui.widget.components.card.NormalCard
 import io.legado.app.ui.widget.components.card.TextCard
 import io.legado.app.ui.widget.components.icon.AppIcon
 import io.legado.app.ui.widget.components.icon.AppIcons
+import io.legado.app.ui.widget.components.lazylist.FastScrollLazyColumn
 import io.legado.app.ui.widget.components.list.ListUiState
 import io.legado.app.ui.widget.components.menuItem.RoundDropdownMenu
 import io.legado.app.ui.widget.components.menuItem.RoundDropdownMenuItem
+import io.legado.app.ui.widget.components.privacy.rememberPrivateLockedBookUrls
 import io.legado.app.ui.widget.components.progressIndicator.AppCircularProgressIndicator
 import io.legado.app.ui.widget.components.progressIndicator.AppLinearProgressIndicator
 import io.legado.app.ui.widget.components.text.AppText
@@ -230,7 +231,11 @@ private fun BookCacheManageScreen(
                 AppCircularProgressIndicator()
             }
         } else {
-            LazyColumn(
+            // 私密且未获准的书：缓存条目保留（缓存管理要能清缓存），但不显示书名与作者
+            val lockedBookUrls = rememberPrivateLockedBookUrls(
+                (filteredShelfBooks + filteredNotShelfBooks).map { it.bookUrl }
+            )
+            FastScrollLazyColumn(
                 modifier = Modifier.fillMaxSize(),
                 contentPadding = adaptiveContentPadding(
                     top = paddingValues.calculateTopPadding(),
@@ -241,7 +246,7 @@ private fun BookCacheManageScreen(
                 cacheSection(
                     title = bookshelfSectionTitle,
                     emptyText = bookshelfSectionEmptyText,
-                    books = filteredShelfBooks,
+                    books = filteredShelfBooks.redactLocked(lockedBookUrls),
                     expandedBookUrls = state.expandedBookUrls,
                     chaptersByBookUrl = state.chaptersByBookUrl,
                     onToggleExpanded = { bookUrl ->
@@ -255,7 +260,7 @@ private fun BookCacheManageScreen(
                     cacheSection(
                         title = notBookshelfSectionTitle,
                         emptyText = notBookshelfSectionEmptyText,
-                        books = filteredNotShelfBooks,
+                        books = filteredNotShelfBooks.redactLocked(lockedBookUrls),
                         expandedBookUrls = state.expandedBookUrls,
                         chaptersByBookUrl = state.chaptersByBookUrl,
                         onToggleExpanded = { bookUrl ->
@@ -295,6 +300,19 @@ private fun BookCacheManageScreen(
         },
         onDismiss = { pendingDeleteChapter = null }
     )
+}
+
+/**
+ * 私密且未获准的书：**书名与作者置空**。
+ *
+ * 不留占位条，也不显示"已隐藏"字样；条目本身保留，否则用户没法清掉这本书的缓存。
+ */
+private fun List<BookCacheBookItem>.redactLocked(
+    lockedBookUrls: Set<String>,
+): List<BookCacheBookItem> = if (lockedBookUrls.isEmpty()) {
+    this
+} else {
+    map { if (it.bookUrl in lockedBookUrls) it.copy(name = "", author = "") else it }
 }
 
 private fun LazyListScope.cacheSection(

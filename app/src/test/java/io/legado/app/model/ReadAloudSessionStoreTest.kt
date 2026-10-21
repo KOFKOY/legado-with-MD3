@@ -4,6 +4,8 @@ import io.legado.app.domain.model.readaloud.ReadAloudPlaybackInfo
 import io.legado.app.domain.model.readaloud.ReadAloudSessionState
 import io.legado.app.domain.model.readaloud.ReadAloudSessionStatus
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
+import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class ReadAloudSessionStoreTest {
@@ -15,6 +17,8 @@ class ReadAloudSessionStoreTest {
             chapterPosition = 42,
             chapterLength = 100,
             text = "current paragraph",
+            chapterTitle = "正在朗读的章节",
+            chapterIndex = 3,
         )
 
         store.setStatus(ReadAloudSessionStatus.Playing)
@@ -41,5 +45,30 @@ class ReadAloudSessionStoreTest {
         store.stop()
 
         assertEquals(ReadAloudSessionState(), store.state.value)
+    }
+
+    @Test
+    fun `detach and restore read aloud follow`() {
+        val store = ReadAloudSessionStore()
+
+        assertTrue(store.state.value.followReadAloudPosition)
+
+        store.detachReadAloudFollow()
+        assertFalse(store.state.value.followReadAloudPosition)
+
+        store.restoreReadAloudFollow()
+        assertTrue(store.state.value.followReadAloudPosition)
+    }
+
+    @Test
+    fun `updates timer chapters correctly`() {
+        val store = ReadAloudSessionStore()
+        assertEquals(0, store.state.value.timerChapters)
+
+        store.updateTimerChapters(3)
+        assertEquals(3, store.state.value.timerChapters)
+
+        store.updateTimerChapters(0)
+        assertEquals(0, store.state.value.timerChapters)
     }
 }

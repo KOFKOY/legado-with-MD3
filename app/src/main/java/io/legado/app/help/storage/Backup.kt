@@ -6,13 +6,14 @@ import androidx.core.net.toUri
 import androidx.documentfile.provider.DocumentFile
 import io.legado.app.constant.AppLog
 import io.legado.app.constant.PreferKey
+import io.legado.app.data.repository.HttpTtsRepository
 import io.legado.app.data.appDb
+import io.legado.app.domain.gateway.BackupSettingsGateway
 import io.legado.app.domain.gateway.ReadStyleGateway
 import io.legado.app.exception.NoStackTraceException
 import io.legado.app.help.AppWebDav
 import io.legado.app.help.DirectLinkUpload
 import io.legado.app.help.book.isLocal
-import io.legado.app.help.config.AppConfig
 import io.legado.app.help.config.AppConfigStore
 import io.legado.app.help.config.LocalConfig
 import io.legado.app.help.config.ReadBookConfig
@@ -53,6 +54,9 @@ object Backup {
     private val readStyleGateway: ReadStyleGateway
         get() = GlobalContext.get().get()
 
+    private val backupSettingsGateway: BackupSettingsGateway
+        get() = GlobalContext.get().get()
+
     val backupPath: String by lazy {
         appCtx.filesDir.getFile("backup").createFolderIfNotExist().absolutePath
     }
@@ -64,6 +68,7 @@ object Backup {
         arrayOf(
             "bookshelf.json",
             "bookmark.json",
+            "bookMarking.json",
             "bookGroup.json",
             "bookSource.json",
             "rssSources.json",
@@ -76,6 +81,7 @@ object Backup {
             "sourceSub.json",
             "txtTocRule.json",
             "httpTTS.json",
+            "httpTtsVoices.json",
             "keyboardAssists.json",
             "dictRule.json",
             "homepageModules.json",
@@ -96,8 +102,8 @@ object Backup {
     private fun getNowZipFileName(): String {
         val backupDate = SimpleDateFormat("yyyy-MM-dd", Locale.getDefault())
             .format(Date(System.currentTimeMillis()))
-        val deviceName = AppConfig.webDavDeviceName
-        return if (deviceName?.isNotBlank() == true) {
+        val deviceName = backupSettingsGateway.currentSettings.webDavDeviceName
+        return if (deviceName.isNotBlank()) {
             "backup${backupDate}-${deviceName}.zip"
         } else {
             "backup${backupDate}.zip"
@@ -116,7 +122,7 @@ object Backup {
                     if (shouldBackup()) {
                         val backupZipFileName = getNowZipFileName()
                         if (!AppWebDav.hasBackUp(backupZipFileName)) {
-                            backup(context, AppConfig.backupPath)
+                            backup(context, backupSettingsGateway.currentSettings.backupPath)
                         } else {
                             LocalConfig.lastBackup = System.currentTimeMillis()
                         }
@@ -146,8 +152,10 @@ object Backup {
             "bookshelf.json",
             backupPath,
         )
+        // 书签与划线/想法笔记（book_marks）视为一体，统一受既有 bookmark 忽略项控制
         if (BackupConfig.dbIsNotIgnored("bookmark", true)) {
             writeListToJson(appDb.bookmarkDao.all, "bookmark.json", backupPath)
+            writeListToJson(appDb.bookMarkingDao.all, "bookMarking.json", backupPath)
         }
         if (BackupConfig.dbIsNotIgnored("bookGroup", true)) {
             writeListToJson(appDb.bookGroupDao.all, "bookGroup.json", backupPath)
@@ -179,7 +187,10 @@ object Backup {
             writeListToJson(appDb.txtTocRuleDao.all, "txtTocRule.json", backupPath)
         }
         if (BackupConfig.dbIsNotIgnored("httpTTS", true)) {
-            writeListToJson(appDb.httpTTSDao.all, "httpTTS.json", backupPath)
+            val snapshot = GlobalContext.get().get<HttpTtsRepository>().backupSnapshot()
+            writeListToJson(snapshot.sources, "httpTTS.json", backupPath)
+            // 空数组也要写出，用来区分旧备份未保存音色与确实没有音色。
+            File(backupPath, "httpTtsVoices.json").writeText(GSON.toJson(snapshot.voices))
         }
         if (BackupConfig.dbIsNotIgnored("keyboardAssists", true)) {
             writeListToJson(appDb.keyboardAssistsDao.all, "keyboardAssists.json", backupPath)
@@ -246,11 +257,37 @@ object Backup {
         currentCoroutineContext().ensureActive()
         val configMap = AppConfigStore.preferences.asMap()
             .mapKeys { it.key.name }
+            .toMutableMap()
+        if (PreferKey.bookshelfSelectedGroupId !in configMap) {
+            (configMap[PreferKey.saveTabPosition] as? Long)?.let {
+                configMap[PreferKey.bookshelfSelectedGroupId] = it
+            }
+        }
+        if (PreferKey.readBrightnessMode !in configMap) {
+            when (val legacy = configMap[PreferKey.showBrightnessView]) {
+                is String -> configMap[PreferKey.readBrightnessMode] = legacy
+                is Boolean -> configMap[PreferKey.readBrightnessMode] = if (legacy) "1" else "0"
+            }
+        }
+        if (PreferKey.readBrightnessControlPosition !in configMap) {
+            when (val legacy = configMap[PreferKey.brightnessVwPos]) {
+                is String -> configMap[PreferKey.readBrightnessControlPosition] = legacy
+                is Boolean -> configMap[PreferKey.readBrightnessControlPosition] =
+                    if (legacy) "1" else "0"
+            }
+        }
         val xmlBuilder = StringBuilder()
         xmlBuilder.append("<?xml version='1.0' encoding='utf-8' standalone='yes' ?>\n")
         xmlBuilder.append("<map>\n")
         configMap.forEach { (key, value) ->
-            if (BackupConfig.keyIsNotIgnore(key, true)) {
+            // 这些旧键在其他 Legado 变体中有不同类型或含义，备份只导出独立键。
+            if (key !in setOf(
+                    PreferKey.saveTabPosition,
+                    PreferKey.showBrightnessView,
+                    PreferKey.brightnessVwPos
+                )
+                && BackupConfig.keyIsNotIgnore(key, true)
+            ) {
                 val finalValue = if (key == PreferKey.webDavPassword) {
                     aes.runCatching { encryptBase64(value.toString()) }.getOrDefault(value.toString())
                 } else value
@@ -276,7 +313,7 @@ object Backup {
             .map(File::getAbsolutePath)
         FileUtils.delete(zipFilePath)
         FileUtils.delete(zipFilePath.replace("tmp_", ""))
-        val backupFileName = if (AppConfig.onlyLatestBackup) {
+        val backupFileName = if (backupSettingsGateway.currentSettings.onlyLatestBackup) {
             "backup.zip"
         } else {
             zipFileName

@@ -14,6 +14,9 @@ import io.legado.app.data.appDb
 import io.legado.app.data.entities.BaseSource
 import io.legado.app.data.entities.Book
 import io.legado.app.data.entities.BookChapter
+import io.legado.app.domain.gateway.ImportBookSettingsGateway
+import io.legado.app.domain.gateway.OtherSettingsGateway
+import io.legado.app.domain.gateway.ReadSettingsGateway
 import io.legado.app.exception.EmptyFileException
 import io.legado.app.exception.NoBooksDirException
 import io.legado.app.exception.NoStackTraceException
@@ -36,12 +39,10 @@ import io.legado.app.help.book.isUmd
 import io.legado.app.help.book.removeLocalUriCache
 import io.legado.app.help.book.simulatedTotalChapterNum
 import io.legado.app.help.book.upKind
-import io.legado.app.help.config.AppConfig
 import io.legado.app.lib.webdav.WebDav
 import io.legado.app.lib.webdav.WebDavException
 import io.legado.app.model.analyzeRule.AnalyzeUrl
 import io.legado.app.model.analyzeRule.CustomUrl
-import io.legado.app.ui.config.otherConfig.OtherConfig
 import io.legado.app.utils.ArchiveUtils
 import io.legado.app.utils.FileDoc
 import io.legado.app.utils.FileUtils
@@ -54,10 +55,12 @@ import io.legado.app.utils.inputStream
 import io.legado.app.utils.isAbsUrl
 import io.legado.app.utils.isContentScheme
 import io.legado.app.utils.isDataUrl
+import io.legado.app.utils.parseToUri
 import io.legado.app.utils.printOnDebug
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.runBlocking
 import org.apache.commons.text.StringEscapeUtils
+import org.koin.core.context.GlobalContext
 import splitties.init.appCtx
 import java.io.ByteArrayInputStream
 import java.io.File
@@ -71,6 +74,10 @@ import java.io.InputStream
  * 支持在线文件(txt epub umd 压缩文件 本地文件
  */
 object LocalBook {
+
+    private val otherSettingsGateway get() = GlobalContext.get().get<OtherSettingsGateway>()
+    private val readSettingsGateway get() = GlobalContext.get().get<ReadSettingsGateway>()
+    private val importBookSettingsGateway get() = GlobalContext.get().get<ImportBookSettingsGateway>()
 
     private val nameAuthorPatterns = arrayOf(
         Regex("(.*?)《([^《》]+)》.*?作者：(.*)"),
@@ -157,15 +164,15 @@ object LocalBook {
         book.durChapterTitle = list.getOrElse(book.durChapterIndex) { list.last() }
             .getDisplayTitle(
                 replaceRules,
-                book.getUseReplaceRule(AppConfig.replaceEnableDefault),
-                chineseConverterType = AppConfig.chineseConverterType,
+                book.getUseReplaceRule(otherSettingsGateway.currentSettings.replaceEnableDefault),
+                chineseConverterType = readSettingsGateway.currentSettings.chineseConverterType,
             )
         book.latestChapterTitle =
             list.getOrElse(book.simulatedTotalChapterNum() - 1) { list.last() }
                 .getDisplayTitle(
                     replaceRules,
-                    book.getUseReplaceRule(AppConfig.replaceEnableDefault),
-                    chineseConverterType = AppConfig.chineseConverterType,
+                    book.getUseReplaceRule(otherSettingsGateway.currentSettings.replaceEnableDefault),
+                    chineseConverterType = readSettingsGateway.currentSettings.chineseConverterType,
                 )
         book.totalChapterNum = list.size
         book.latestChapterTime = System.currentTimeMillis()
@@ -251,6 +258,12 @@ object LocalBook {
         }
         var book = appDb.bookDao.getBook(bookUrl)
         if (book == null) {
+            // 源文件被删掉后重新导入同名文件时，书架里那条记录只是文件位置失效；
+            // 直接 insert 会再裂出一条同名书，应先把它接回这次导入的文件。
+            val reusableBook = findReusableStaleLocalBook(bookUrl, fileName)
+            if (reusableBook != null) {
+                return rebindLocalBook(reusableBook, bookUrl, fileName)
+            }
             val nameAuthor = analyzeNameAuthor(fileName)
             book = Book(
                 type = BookType.text or BookType.local,
@@ -275,6 +288,55 @@ object LocalBook {
             appDb.bookDao.update(book)
         }
         return book
+    }
+
+    /**
+     * 找出"同名、但文件已经读不到"的旧记录，用于把重新导入的同名文件接回这条记录。
+     * 判据见 [planLocalBookImportReuse]。
+     */
+    private fun findReusableStaleLocalBook(importedBookUrl: String, fileName: String): Book? {
+        if (fileName.isBlank()) return null
+        val existingBook = appDb.bookDao.getBookByFileName(fileName) ?: return null
+        return planLocalBookImportReuse(
+            existingBook = existingBook,
+            existingFileReadable = isBookFileReadable(existingBook),
+            importedFileName = fileName,
+            importedBookUrl = importedBookUrl,
+        )
+    }
+
+    /**
+     * 记录的文件是否还读得到。
+     *
+     * 这里刻意不做 [io.legado.app.help.book.getLocalUri] 那样的兜底搜索：那条路径会顺手
+     * 迁移主键，探测本身不应该有副作用；只按 `bookUrl` 直接开一次流。
+     */
+    private fun isBookFileReadable(book: Book): Boolean {
+        val stream = book.bookUrl.parseToUri().inputStream(appCtx).getOrNull() ?: return false
+        stream.use { }
+        return true
+    }
+
+    /**
+     * 把失效记录迁到新文件上：保留分组、阅读进度等用户数据，清掉旧目录、缓存与封面。
+     */
+    private fun rebindLocalBook(staleBook: Book, newBookUrl: String, fileName: String): Book {
+        val oldBook = staleBook.copy()
+        deleteBook(oldBook, false)
+        val reboundBook = oldBook.copy(bookUrl = newBookUrl, originName = fileName)
+        // 触发 isLocalModified：旧目录的正文偏移对新文件没有意义，必须重新解析
+        reboundBook.latestChapterTime = 0
+        upBookInfo(reboundBook)
+        reboundBook.upKind()
+        appDb.runInTransaction {
+            // 旧主键下的章节随记录一起废弃，避免留下查不到的脏行
+            appDb.bookChapterDao.delByBook(oldBook.bookUrl)
+            appDb.bookDao.replace(oldBook, reboundBook)
+            BookHelp.updateCacheFolder(oldBook, reboundBook)
+        }
+        oldBook.removeLocalUriCache()
+        reboundBook.removeLocalUriCache()
+        return reboundBook
     }
 
     fun importMangaDirectory(directory: FileDoc): Book {
@@ -385,11 +447,11 @@ object LocalBook {
         val tempFileName = fileName.substringBeforeLast(".")
         var name = ""
         var author = ""
-        if (!AppConfig.bookImportFileName.isNullOrBlank()) {
+        if (!importBookSettingsGateway.currentSettings.bookImportFileName.isNullOrBlank()) {
             try {
                 //在用户脚本后添加捕获author、name的代码，只要脚本中author、name有值就会被捕获
                 val js =
-                    AppConfig.bookImportFileName + "\nJSON.stringify({author:author,name:name})"
+                    importBookSettingsGateway.currentSettings.bookImportFileName + "\nJSON.stringify({author:author,name:name})"
                 //在脚本中定义如何分解文件名成书名、作者名
                 val jsonStr = RhinoScriptEngine.run {
                     val bindings = ScriptBindings()
@@ -446,7 +508,7 @@ object LocalBook {
         fileName: String,
         source: BaseSource? = null,
     ): Uri {
-        OtherConfig.defaultBookTreeUri
+        otherSettingsGateway.currentSettings.defaultBookTreeUri
             ?: throw NoBooksDirException()
         val inputStream = when {
             str.isAbsUrl() -> AnalyzeUrl(
@@ -472,7 +534,7 @@ object LocalBook {
         fileName: String
     ): Uri {
         inputStream.use {
-            val defaultBookTreeUri = OtherConfig.defaultBookTreeUri
+            val defaultBookTreeUri = otherSettingsGateway.currentSettings.defaultBookTreeUri
             if (defaultBookTreeUri.isNullOrBlank()) throw NoBooksDirException()
             val treeUri = defaultBookTreeUri.toUri()
             return if (treeUri.isContentScheme()) {
@@ -526,7 +588,7 @@ object LocalBook {
         val webDavUrl = localBook.getRemoteUrl()
         if (webDavUrl.isNullOrBlank()) throw NoStackTraceException("Book file is not webDav File")
         try {
-            OtherConfig.defaultBookTreeUri
+            otherSettingsGateway.currentSettings.defaultBookTreeUri
                 ?: throw NoBooksDirException()
             // 兼容旧版链接
             val webdav: WebDav = kotlin.runCatching {

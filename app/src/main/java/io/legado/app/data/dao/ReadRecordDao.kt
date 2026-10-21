@@ -184,6 +184,19 @@ interface ReadRecordDao {
         bookAuthor: String
     ): List<ReadRecord>
 
+    /** 聚合列表项没有真实设备 ID，跨设备查询可供合并的其他记录。 */
+    @Query(
+        """
+        SELECT * FROM readRecord
+        WHERE NOT (bookName = :bookName AND bookAuthor = :bookAuthor)
+        ORDER BY CASE WHEN bookName = :bookName THEN 0 ELSE 1 END, lastRead DESC
+        """
+    )
+    suspend fun getMergeCandidatesAcrossDevices(
+        bookName: String,
+        bookAuthor: String,
+    ): List<ReadRecord>
+
     /**
      * 获取某一天某一本书的所有阅读时段记录
      */
@@ -254,17 +267,31 @@ interface ReadRecordDao {
     @Query("SELECT * FROM readRecordSession WHERE deviceId = :deviceId AND bookName = :bookName AND bookAuthor = :bookAuthor")
     suspend fun getSessionsByBook(deviceId: String, bookName: String, bookAuthor: String): List<ReadRecordSession>
 
-    /** 清理同步产生的、字段完全相同的阅读时段记录，只保留最早写入的一行。 */
+    /** 清理跨设备同步产生的重复阅读时段（忽略 deviceId），只保留最早写入的一行。 */
     @Query(
         """
         DELETE FROM readRecordSession
         WHERE id NOT IN (
             SELECT MIN(id) FROM readRecordSession
-            GROUP BY deviceId, bookName, bookAuthor, startTime, endTime, words
+            GROUP BY bookName, bookAuthor, bookUrl, startTime, endTime, words
         )
         """
     )
     suspend fun deleteDuplicateSessions()
+
+    /** 阅读记录合并后，仅清理目标设备下该书的重复时段。 */
+    @Query(
+        """
+        DELETE FROM readRecordSession
+        WHERE id NOT IN (
+            SELECT MIN(id) FROM readRecordSession
+            WHERE deviceId = :deviceId AND bookName = :bookName AND bookAuthor = :bookAuthor
+            GROUP BY bookName, bookAuthor, bookUrl, startTime, endTime, words
+        )
+        AND deviceId = :deviceId AND bookName = :bookName AND bookAuthor = :bookAuthor
+        """
+    )
+    suspend fun deleteDuplicateSessionsByBook(deviceId: String, bookName: String, bookAuthor: String)
 
     @Query(
         """
@@ -272,6 +299,7 @@ interface ReadRecordDao {
         WHERE deviceId = :deviceId
         AND bookName = :bookName
         AND bookAuthor = :bookAuthor
+        AND bookUrl = :bookUrl
         AND startTime = :startTime
         AND endTime = :endTime
         AND words = :words
@@ -282,10 +310,35 @@ interface ReadRecordDao {
         deviceId: String,
         bookName: String,
         bookAuthor: String,
+        bookUrl: String,
         startTime: Long,
         endTime: Long,
         words: Long
     ): ReadRecordSession?
+
+    /** 按书籍副本取全部阅读时段，用于副本归属迁移前的快照。 */
+    @Query("SELECT * FROM readRecordSession WHERE bookUrl = :bookUrl ORDER BY startTime ASC")
+    suspend fun getSessionsByBookUrl(bookUrl: String): List<ReadRecordSession>
+
+    /**
+     * 把某个书籍副本的阅读时段整体交给另一个副本。
+     *
+     * 迁移/换源后旧书被删除，会话必须改挂新副本，否则新副本会从零开始计时、
+     * 旧时长变成孤儿；若新书书名作者发生变化，会话的聚合键同步改写。
+     */
+    @Query(
+        """
+        UPDATE readRecordSession
+        SET bookUrl = :newBookUrl, bookName = :newBookName, bookAuthor = :newBookAuthor
+        WHERE bookUrl = :oldBookUrl
+        """
+    )
+    suspend fun reassignSessionOwnership(
+        oldBookUrl: String,
+        newBookUrl: String,
+        newBookName: String,
+        newBookAuthor: String,
+    )
 
     @Query("SELECT * FROM readRecordSession WHERE deviceId = :deviceId AND bookName = :bookName AND bookAuthor = :bookAuthor ORDER BY startTime DESC")
     fun getSessionsByBookFlow(deviceId: String, bookName: String, bookAuthor: String): Flow<List<ReadRecordSession>>

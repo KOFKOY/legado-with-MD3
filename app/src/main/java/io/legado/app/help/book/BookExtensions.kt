@@ -19,12 +19,14 @@ import io.legado.app.data.entities.BookGroup
 import io.legado.app.data.entities.BookSource
 import io.legado.app.data.entities.HighlightTagRule
 import io.legado.app.data.entities.TagGroupRule
+import io.legado.app.domain.gateway.BookExportSettingsGateway
+import io.legado.app.domain.gateway.ImportBookSettingsGateway
+import io.legado.app.domain.gateway.OtherSettingsGateway
+import io.legado.app.domain.gateway.ReadSettingsGateway
 import io.legado.app.exception.NoStackTraceException
 import io.legado.app.help.RuleBigDataHelp
-import io.legado.app.help.config.AppConfig
 import io.legado.app.model.localBook.LocalBook
 import io.legado.app.ui.book.info.HighlightedTag
-import io.legado.app.ui.config.otherConfig.OtherConfig
 import io.legado.app.utils.FileDoc
 import io.legado.app.utils.GSON
 import io.legado.app.utils.MD5Utils
@@ -35,17 +37,22 @@ import io.legado.app.utils.isUri
 import io.legado.app.utils.normalizeFileName
 import io.legado.app.utils.splitNotBlank
 import io.legado.app.utils.toastOnUi
-import splitties.init.appCtx
-import java.io.File
-import java.util.concurrent.ConcurrentHashMap
-import kotlinx.datetime.Clock
 import kotlinx.datetime.LocalDate
 import kotlinx.datetime.TimeZone
 import kotlinx.datetime.daysUntil
 import kotlinx.datetime.todayIn
+import org.koin.core.context.GlobalContext
+import splitties.init.appCtx
+import java.io.File
+import java.util.concurrent.ConcurrentHashMap
 import kotlin.math.max
 import kotlin.math.min
+import kotlin.time.Clock
 
+private val otherGateway by lazy { GlobalContext.get().get<OtherSettingsGateway>() }
+private val importBookGateway by lazy { GlobalContext.get().get<ImportBookSettingsGateway>() }
+private val readGateway by lazy { GlobalContext.get().get<ReadSettingsGateway>() }
+private val exportGateway by lazy { GlobalContext.get().get<BookExportSettingsGateway>() }
 
 val Book.isAudio: Boolean
     get() = isType(BookType.audio)
@@ -189,8 +196,8 @@ fun Book.getLocalUri(): Uri {
         return uri
     }
     //不同的设备书籍保存路径可能不一样, uri无效时尝试寻找当前保存路径下的文件
-    val defaultBookDir = OtherConfig.defaultBookTreeUri
-    val importBookDir = AppConfig.importBookPath
+    val defaultBookDir = otherGateway.currentSettings.defaultBookTreeUri
+    val importBookDir = importBookGateway.currentSettings.importBookPath
 
     // 查找书籍保存目录
     if (!defaultBookDir.isNullOrBlank()) {
@@ -208,14 +215,18 @@ fun Book.getLocalUri(): Uri {
                     return fileDoc.uri
                 }
                 appDb.runInTransaction {
-
                     if (oldBook.bookUrl == newBookUrl) {
                         save()
                     } else {
-                        val newBook = oldBook.copy(bookUrl = newBookUrl)
+                        // 主键迁移后旧目录的正文偏移对新文件没有意义：清掉解析时间让
+                        // isLocalModified() 为真，本次会话内就会按新文件重新解析目录，
+                        // 否则阅读器会拿旧章节偏移读新文件，一直停在加载占位页。
+                        val newBook = oldBook.copy(bookUrl = newBookUrl, latestChapterTime = 0)
+                        appDb.bookChapterDao.delByBook(oldBook.bookUrl)
                         appDb.bookDao.replace(oldBook, newBook)
                         BookHelp.updateCacheFolder(oldBook, newBook)
                         this.bookUrl = newBookUrl
+                        this.latestChapterTime = 0
                     }
                 }
                 localUriCache[newBookUrl] = fileDoc.uri
@@ -244,10 +255,13 @@ fun Book.getLocalUri(): Uri {
                 if (oldBook.bookUrl == newBookUrl) {
                     save()
                 } else {
-                    val newBook = oldBook.copy(bookUrl = newBookUrl)
+                    // 同保存目录分支：迁主键后必须按新文件重新解析目录
+                    val newBook = oldBook.copy(bookUrl = newBookUrl, latestChapterTime = 0)
+                    appDb.bookChapterDao.delByBook(oldBook.bookUrl)
                     appDb.bookDao.replace(oldBook, newBook)
                     BookHelp.updateCacheFolder(oldBook, newBook)
                     this.bookUrl = newBookUrl
+                    this.latestChapterTime = 0
                 }
             }
             localUriCache[newBookUrl] = fileDoc.uri
@@ -261,7 +275,7 @@ fun Book.getLocalUri(): Uri {
 
 
 fun Book.getArchiveUri(): Uri? {
-    val defaultBookDir = OtherConfig.defaultBookTreeUri
+    val defaultBookDir = otherGateway.currentSettings.defaultBookTreeUri
     return if (isArchive && !defaultBookDir.isNullOrBlank()) {
         FileDoc.fromUri(defaultBookDir.toUri(), true)
             .find(archiveName)?.uri
@@ -542,8 +556,8 @@ fun Book.sync(oldBook: Book) {
         appDb.bookChapterDao.getChapter(bookUrl, durChapterIndex)?.let {
             durChapterTitle = it.getDisplayTitle(
                 replaceRules,
-                getUseReplaceRule(AppConfig.replaceEnableDefault),
-                chineseConverterType = AppConfig.chineseConverterType,
+                getUseReplaceRule(otherGateway.currentSettings.replaceEnableDefault),
+                chineseConverterType = readGateway.currentSettings.chineseConverterType,
             )
         }
     }
@@ -619,7 +633,7 @@ fun Book.isSameNameAuthor(other: Any?): Boolean {
 
 fun Book.getExportFileName(
     suffix: String,
-    template: String? = AppConfig.bookExportFileName,
+    template: String? = exportGateway.currentSettings.bookExportFileName,
 ): String {
     if (template.isNullOrBlank()) {
         return "$name 作者：${getRealAuthor()}.$suffix"
@@ -672,7 +686,7 @@ fun Book.getExportFileName(
 fun Book.getExportFileName(
     suffix: String,
     epubIndex: Int,
-    jsStr: String? = AppConfig.episodeExportFileName
+    jsStr: String? = exportGateway.currentSettings.episodeExportFileName
 ): String {
     // 默认规则
     val default = "$name 作者：${getRealAuthor()} [${epubIndex}].$suffix"

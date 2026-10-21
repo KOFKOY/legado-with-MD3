@@ -4,18 +4,17 @@ import io.legado.app.constant.AppLog
 import io.legado.app.data.entities.Book
 import io.legado.app.data.entities.BookChapter
 import io.legado.app.data.entities.BookSource
-import io.legado.app.help.book.isImage
 import io.legado.app.exception.ConcurrentException
 import io.legado.app.help.book.BookHelp
 import io.legado.app.help.coroutine.CompositeCoroutine
 import io.legado.app.help.coroutine.Coroutine
+import io.legado.app.model.cache.CacheChapterProgress
+import io.legado.app.model.cache.CacheChapterProgressPhase
 import io.legado.app.model.cache.CacheDownloadCandidate
 import io.legado.app.model.cache.CacheDownloadQueue
 import io.legado.app.model.cache.CacheDownloadRepository
 import io.legado.app.model.cache.CacheDownloadRequest
 import io.legado.app.model.cache.CacheDownloadSource
-import io.legado.app.model.cache.CacheChapterProgress
-import io.legado.app.model.cache.CacheChapterProgressPhase
 import io.legado.app.model.cache.CacheDownloadStateStore
 import io.legado.app.model.cache.ChapterSelection
 import kotlinx.coroutines.CancellationException
@@ -186,7 +185,7 @@ class CacheBookModel(
      */
     @Synchronized
     fun hasLaunchableChapters(): Boolean {
-        return !isPaused && (queue.waitingCount() > 0 || isLoading)
+        return !isPaused && (queue.hasLaunchableChapter(onDownloadSet) || isLoading)
     }
 
     @Synchronized
@@ -297,11 +296,12 @@ class CacheBookModel(
         synchronized(this) {
             isStopped = false
             val selected = selectionIndices(request.selection)
-            // 整书暂停时再入队：只解冻本次请求的章节，其余等待章转为单章暂停
-            if (isPaused) {
+            // An explicit request resumes only its selected chapters. Reader preloads must not
+            // override a user's pause for this book or the global download queue.
+            if (isPaused && request.source != CacheDownloadSource.ReadPreload) {
                 releaseBookPauseKeepingOnly(selected)
+                isPaused = false
             }
-            isPaused = false
             when (val selection = request.selection) {
                 is ChapterSelection.Range -> {
                     canceledDownloadSet.removeAll { it in selection.start..selection.end }
@@ -508,7 +508,7 @@ class CacheBookModel(
             onSkipped(chapterIndex)
             return
         }
-        if (repository.hasImageContent(book, chapter)) {
+        if (repository.hasImageContent(book, chapter, queue.isExplicitDownload(chapter.index))) {
             onSkipped(chapterIndex)
             return
         }
@@ -521,6 +521,7 @@ class CacheBookModel(
                 bookSource = bookSource,
                 book = book,
                 chapter = chapter,
+                explicitDownload = queue.isExplicitDownload(chapter.index),
                 start = CoroutineStart.LAZY,
                 onProgress = { completed, total ->
                     reportImageDownloadProgress(chapter, completed, total)
@@ -619,11 +620,19 @@ class CacheBookModel(
         content: String? = null,
     ) {
         task.onSuccess(IO) {
-            if (chainImagesAfterContent && !repository.hasImageContent(book, chapter)) {
-                startImageCacheTask(scope, context, chapter, chapterIndex, it as String)
-                return@onSuccess
+            synchronized(this@CacheBookModel) {
+                // 与 addRequest 共用锁：用途复核和完成提交之间不能插入新的显式请求。
+                val explicitDownload = queue.isExplicitDownload(chapterIndex)
+                if ((chainImagesAfterContent || explicitDownload) &&
+                    !repository.hasImageContent(book, chapter, explicitDownload)) {
+                    startImageCacheTask(
+                        scope, context, chapter, chapterIndex,
+                        (it as? String) ?: content ?: BookHelp.getContent(book, chapter).orEmpty(),
+                    )
+                    return@onSuccess
+                }
+                completeChapterCache(chapter, content ?: (it as? String))
             }
-            completeChapterCache(chapter, content ?: (it as? String))
         }.onError(IO) {
             onPreError(chapter, it)
             try {
@@ -676,6 +685,7 @@ class CacheBookModel(
             bookSource = bookSource,
             book = book,
             chapter = chapter,
+            explicitDownload = queue.isExplicitDownload(chapter.index),
             start = CoroutineStart.LAZY,
             onProgress = { completed, total ->
                 reportImageDownloadProgress(chapter, completed, total)
@@ -721,12 +731,13 @@ class CacheBookModel(
     }
 
     private suspend fun ensureChapterImagesCached(chapter: BookChapter) {
-        if (repository.hasImageContent(book, chapter)) return
+        if (repository.hasImageContent(book, chapter, queue.isExplicitDownload(chapter.index))) return
         reportImageDownloadProgress(chapter, completed = 0)
         repository.saveCachedImagesAwait(
             bookSource = bookSource,
             book = book,
             chapter = chapter,
+            explicitDownload = queue.isExplicitDownload(chapter.index),
             onProgress = { completed, total ->
                 reportImageDownloadProgress(chapter, completed, total)
             },

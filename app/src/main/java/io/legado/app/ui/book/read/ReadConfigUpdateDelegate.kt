@@ -55,6 +55,7 @@ class ReadConfigUpdateDelegate(
 
     fun handle(update: ConfigUpdate) {
         val styleMutation = update.toReadStyleMutation()
+        val deferEffectsUntilStyleSelectionApplied = update is ConfigUpdate.StyleSelect
         styleMutation?.let(readBookStyleConfigRepository::updateCurrentStyle)
         when (update) {
             // --- Text style ---
@@ -75,6 +76,7 @@ class ReadConfigUpdateDelegate(
             is ConfigUpdate.TitleLineSpacingExtra,
             is ConfigUpdate.TitleLineSpacingSub,
             is ConfigUpdate.TitleSize,
+            is ConfigUpdate.TitleSizeRelative,
             is ConfigUpdate.TitleTopSpacing,
             is ConfigUpdate.TitleBottomSpacing,
             is ConfigUpdate.TitleColor,
@@ -114,6 +116,11 @@ class ReadConfigUpdateDelegate(
             is ConfigUpdate.StyleSelect -> {
                 scope.launch {
                     readSettingsRepository.setStyleSelect(ReadSessionState.isComic, update.index)
+                    // The selected style supplies ReadBookConfig's active text color.
+                    // Publish reload only after this write, so source-side image JS
+                    // observes the newly selected reading theme.
+                    host.refreshConfigSnapshots()
+                    host.emitEffect(ReadBookEffect.UpdateReaderConfig(update.actions))
                 }
             }
             is ConfigUpdate.ShareLayout -> {
@@ -122,6 +129,7 @@ class ReadConfigUpdateDelegate(
                 }
             }
             is ConfigUpdate.PageAnim -> Unit
+            is ConfigUpdate.PageAnimSpeed -> Unit
 
             // --- Menu appearance ---
             is ConfigUpdate.MenuBgColor -> {
@@ -644,7 +652,7 @@ class ReadConfigUpdateDelegate(
                     // 等写入落地再发 UpdateStyle，否则 upBookmarkBadge 读到旧尺寸
                     readSettingsRepository.preferences.first { it.bookmarkBadgeSize == update.value }
                     host.emitEffect(
-                        ReadBookEffect.UpdateReadViewConfig(setOf(ConfigUpdateAction.UpdateStyle))
+                        ReadBookEffect.UpdateReaderConfig(setOf(ConfigUpdateAction.UpdateStyle))
                     )
                 }
             }
@@ -679,6 +687,16 @@ class ReadConfigUpdateDelegate(
                 }
                 scope.launch {
                     readSettingsRepository.setAutoSuggestDayNight(update.value)
+                }
+            }
+            is ConfigUpdate.ReadingAnchorEnabled -> {
+                scope.launch {
+                    readSettingsRepository.setReadingAnchorEnabled(update.value)
+                }
+            }
+            is ConfigUpdate.ReadAloudDetachReminderEnabled -> {
+                scope.launch {
+                    readSettingsRepository.setReadAloudDetachReminderEnabled(update.value)
                 }
             }
             is ConfigUpdate.SelectText -> {
@@ -743,11 +761,11 @@ class ReadConfigUpdateDelegate(
         // 走了 gateway 的更新由 collectReadStyle 重建快照；只写 DataStore 的更新
         // 不经 gateway，需在此手工重建——且必须两份一起，
         // 否则像 ChineseConverterType 这种本就在 sheetConfig 里的项会一直显示旧值。
-        if (styleMutation == null) {
+        if (styleMutation == null && !deferEffectsUntilStyleSelectionApplied) {
             host.refreshConfigSnapshots()
         }
-        if (update.actions.isNotEmpty()) {
-            host.emitEffect(ReadBookEffect.UpdateReadViewConfig(update.actions))
+        if (update.actions.isNotEmpty() && !deferEffectsUntilStyleSelectionApplied) {
+            host.emitEffect(ReadBookEffect.UpdateReaderConfig(update.actions))
         }
     }
 
@@ -769,6 +787,8 @@ class ReadConfigUpdateDelegate(
         is ConfigUpdate.TitleLineSpacingSub ->
             intMutation(ReadStyleIntKey.TitleLineSpacingSub, value)
         is ConfigUpdate.TitleSize -> intMutation(ReadStyleIntKey.TitleSize, value)
+        is ConfigUpdate.TitleSizeRelative ->
+            booleanMutation(ReadStyleBooleanKey.TitleSizeRelative, value)
         is ConfigUpdate.TitleTopSpacing -> intMutation(ReadStyleIntKey.TitleTopSpacing, value)
         is ConfigUpdate.TitleBottomSpacing ->
             intMutation(ReadStyleIntKey.TitleBottomSpacing, value)
@@ -812,6 +832,7 @@ class ReadConfigUpdateDelegate(
             colorMutation(ReadStyleColorKey.TipFooterNight, color)
         is ConfigUpdate.TipDividerColor -> colorMutation(ReadStyleColorKey.TipDivider, color)
         is ConfigUpdate.PageAnim -> intMutation(ReadStyleIntKey.PageAnim, value)
+        is ConfigUpdate.PageAnimSpeed -> intMutation(ReadStyleIntKey.PageAnimSpeed, value)
         is ConfigUpdate.TextShadow -> booleanMutation(ReadStyleBooleanKey.TextShadow, value)
         is ConfigUpdate.ShadowRadius -> floatMutation(ReadStyleFloatKey.ShadowRadius, value)
         is ConfigUpdate.ShadowDx -> floatMutation(ReadStyleFloatKey.ShadowDx, value)

@@ -7,6 +7,7 @@ import androidx.compose.ui.graphics.Color
 import io.legado.app.data.entities.Book
 import io.legado.app.data.entities.BookChapter
 import io.legado.app.data.entities.BookProgress
+import io.legado.app.data.entities.BookSource
 import io.legado.app.ui.book.manga.config.MangaScrollMode
 import kotlinx.collections.immutable.ImmutableList
 import kotlinx.collections.immutable.persistentListOf
@@ -23,9 +24,11 @@ data class MangaReaderUiState(
     val sourceName: String = "",
     val sourceUrl: String? = null,
     val sourceType: Int? = null,
+    val sourceCustomButtonAvailable: Boolean = false,
     val changeSourceBook: MangaBookSnapshot? = null,
     val pages: ImmutableList<MangaReaderItemUi> = persistentListOf(),
     val currentItemIndex: Int = 0,
+    val footerItemIndex: Int? = null,
     val currentPage: Int = 0,
     val pageCount: Int = 0,
     val chapterIndex: Int = 0,
@@ -62,6 +65,7 @@ sealed interface MangaReaderItemUi {
         val pageIndex: Int,
         val pageCount: Int,
         val chapterName: String,
+        val chapterSubject: String,
         val loadState: MangaPageLoadState = MangaPageLoadState.Queued,
         val retryRevision: Int = 0,
     ) : MangaReaderItemUi
@@ -92,7 +96,13 @@ sealed interface MangaReaderItemUi {
 @Stable
 sealed interface MangaPageLoadState {
     data object Queued : MangaPageLoadState
-    data object Loading : MangaPageLoadState
+
+    /**
+     * @param progress 下载百分比 0..100；服务端未返回 Content-Length 时为 null，
+     * 此时 UI 退回不确定进度（只转圈，不显示数字）。
+     */
+    data class Loading(val progress: Int? = null) : MangaPageLoadState
+
     data object Ready : MangaPageLoadState
     data class Failed(val message: String?) : MangaPageLoadState
 }
@@ -122,7 +132,9 @@ data class MangaReaderSettings(
     val disableClickScroll: Boolean = false,
     val longPressEnabled: Boolean = true,
     val preDownloadCount: Int = 10,
-    val chapterPrefetchCount: Int = 1,
+    val chapterPrefetchCount: Int = 0,
+    val previousChapterPrefetchCount: Int = 0,
+    val autoOfflineCache: Boolean = false,
     val autoReadSpeed: Int = 3,
     val volumeKeyPage: Boolean = false,
     val reverseVolumeKeyPage: Boolean = false,
@@ -205,7 +217,9 @@ sealed interface MangaReaderIntent {
     data object PayCurrentChapter : MangaReaderIntent
     data object OpenSourceLogin : MangaReaderIntent
     data object OpenSourceEdit : MangaReaderIntent
+    data class SourceCustomButton(val longClick: Boolean) : MangaReaderIntent
     data object BackPressed : MangaReaderIntent
+    data object CloseReader : MangaReaderIntent
     data object ToggleMenu : MangaReaderIntent
     data object HideMenu : MangaReaderIntent
     data object Retry : MangaReaderIntent
@@ -230,9 +244,13 @@ sealed interface MangaReaderIntent {
     data class UpdateMenuPaletteStyle(val value: String) : MangaReaderIntent
     data class UpdateClickAction(val index: Int, val action: Int) : MangaReaderIntent
     data class RetryChapter(val chapterIndex: Int) : MangaReaderIntent
-    data class PageLoadStarted(val key: String) : MangaReaderIntent
-    data class PageLoadSucceeded(val key: String) : MangaReaderIntent
-    data class PageLoadFailed(val key: String, val message: String?) : MangaReaderIntent
+    data class RequestAdjacentChapter(val chapterIndex: Int) : MangaReaderIntent
+    data class PageLoadStarted(val requestId: MangaPageRequestId, val force: Boolean = false) :
+        MangaReaderIntent
+
+    data class PageLoadSucceeded(val requestId: MangaPageRequestId) : MangaReaderIntent
+    data class PageLoadFailed(val requestId: MangaPageRequestId, val message: String?) :
+        MangaReaderIntent
     data class RetryPage(val key: String) : MangaReaderIntent
     data class RetryFailedPagesInChapter(val chapterIndex: Int) : MangaReaderIntent
     data class PageStep(val direction: Int) : MangaReaderIntent
@@ -241,6 +259,13 @@ sealed interface MangaReaderIntent {
         val itemIndex: Int,
         val firstItemIndex: Int = itemIndex,
         val lastItemIndex: Int = itemIndex,
+        /** Adjacent chapters may be precomposed; only promote after the current chapter leaves view. */
+        val currentChapterVisible: Boolean,
+        val navigationId: Long,
+    ) : MangaReaderIntent
+
+    data class FooterItemChanged(
+        val itemIndex: Int,
         val navigationId: Long,
     ) : MangaReaderIntent
     data class PagerScrollChanged(val inProgress: Boolean) : MangaReaderIntent
@@ -299,6 +324,8 @@ enum class MangaReaderSettingKey {
     LONG_PRESS,
     PRE_DOWNLOAD,
     CHAPTER_PREFETCH,
+    CHAPTER_PREFETCH_PREV,
+    AUTO_OFFLINE_CACHE,
     AUTO_READ_SPEED,
     VOLUME_KEY_PAGE,
     REVERSE_VOLUME_KEY_PAGE,
@@ -336,6 +363,12 @@ sealed interface MangaReaderEffect {
     data class OpenChapterUrl(val externalBrowser: Boolean) : MangaReaderEffect
     data class OpenSourceLogin(val sourceUrl: String) : MangaReaderEffect
     data class OpenSourceEdit(val sourceUrl: String) : MangaReaderEffect
+    data class RunSourceCustomButton(
+        val event: String,
+        val source: BookSource,
+        val book: Book,
+        val chapter: BookChapter?,
+    ) : MangaReaderEffect
     data class OpenPaymentUrl(
         val url: String,
         val sourceOrigin: String?,
@@ -346,4 +379,24 @@ sealed interface MangaReaderEffect {
     data class SetSystemBarsVisible(val visible: Boolean) : MangaReaderEffect
     data class ShareImage(val filePath: String) : MangaReaderEffect
     data class CopyImage(val filePath: String) : MangaReaderEffect
+}
+
+/** 加载回调必须同时匹配书籍、页面与重试代次。 */
+@Stable
+data class MangaPageRequestId(val bookUrl: String, val key: String, val retryRevision: Int)
+
+internal val MangaReaderItemUi.Page.requestId: MangaPageRequestId
+    get() = MangaPageRequestId(bookUrl, key, retryRevision)
+
+internal fun MangaReaderItemUi.Page.reduceImageLoad(
+    requestId: MangaPageRequestId,
+    next: MangaPageLoadState,
+    force: Boolean = false,
+): MangaReaderItemUi.Page {
+    if (this.requestId != requestId) return this
+    if (!force && next is MangaPageLoadState.Loading && loadState == MangaPageLoadState.Ready) return this
+    val reduced = if (next is MangaPageLoadState.Loading) {
+        next.copy(progress = (loadState as? MangaPageLoadState.Loading)?.progress ?: next.progress)
+    } else next
+    return if (loadState == reduced) this else copy(loadState = reduced)
 }

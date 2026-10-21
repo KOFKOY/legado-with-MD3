@@ -11,7 +11,9 @@ import io.legado.app.constant.ReadMenuBlurStyle
 import io.legado.app.domain.gateway.ReadSettingsGateway
 import io.legado.app.domain.model.settings.ReadSettings
 import io.legado.app.help.config.AppConfigStore
+import io.legado.app.help.config.compatDsString
 import io.legado.app.help.config.compatDsValue
+import io.legado.app.help.config.rawPrefValue
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.map
@@ -81,10 +83,10 @@ class ReadSettingsRepository(
         settingsRepository.putBoolean(PreferKey.useZhLayout, value)
 
     suspend fun setShowBrightnessView(value: String) =
-        settingsRepository.putString(PreferKey.showBrightnessView, value)
+        settingsRepository.putString(PreferKey.readBrightnessMode, value)
 
     suspend fun setBrightnessVwPos(value: String) =
-        settingsRepository.putString(PreferKey.brightnessVwPos, value)
+        settingsRepository.putString(PreferKey.readBrightnessControlPosition, value)
 
     suspend fun setReadBrightness(value: Int) =
         settingsRepository.putInt(PreferKey.brightness, value)
@@ -136,6 +138,12 @@ class ReadSettingsRepository(
 
     suspend fun setAutoSuggestDayNight(value: Boolean) =
         settingsRepository.putBoolean(PreferKey.autoSuggestDayNight, value)
+
+    suspend fun setReadingAnchorEnabled(value: Boolean) =
+        settingsRepository.putBoolean(PreferKey.readingAnchorEnabled, value)
+
+    suspend fun setReadAloudDetachReminderEnabled(value: Boolean) =
+        settingsRepository.putBoolean(PreferKey.readAloudDetachReminderEnabled, value)
 
     suspend fun setSelectText(value: Boolean) =
         settingsRepository.putBoolean(PreferKey.selectText, value)
@@ -337,7 +345,23 @@ class ReadSettingsRepository(
         }
     }
 
+    /**
+     * 快照不可变，且写入必经 `AppConfigStore.rebuild()` 换新实例，因此按实例缓存映射结果。
+     * 读侧每个 `ReadBookConfig` 属性都取 [currentSettings]，不缓存则每属性重建整份记录。
+     */
+    @Volatile
+    private var settingsMemo: SettingsMemo? = null
+
+    private class SettingsMemo(val preferences: Preferences, val settings: ReadSettings)
+
     internal fun Preferences.toReadSettings(): ReadSettings {
+        settingsMemo?.let {
+            if (it.preferences === this) return it.settings
+        }
+        return buildReadSettings().also { settingsMemo = SettingsMemo(this, it) }
+    }
+
+    private fun Preferences.buildReadSettings(): ReadSettings {
         val readStyleSelect = compatDsValue(Keys.ReadStyleSelect, 0)
         return ReadSettings(
             screenOrientation = compatDsValue(Keys.ScreenOrientation, "0"),
@@ -353,8 +377,16 @@ class ReadSettingsRepository(
             textBottomJustify = compatDsValue(Keys.TextBottomJustify, true),
             adaptSpecialStyle = compatDsValue(Keys.AdaptSpecialStyle, true),
             useZhLayout = compatDsValue(Keys.UseZhLayout, false),
-            showBrightnessView = compatDsValue(Keys.ShowBrightnessView, "0"),
-            brightnessVwPos = compatDsValue(Keys.BrightnessVwPos, "1"),
+            showBrightnessView = compatDsString(PreferKey.readBrightnessMode)
+                ?: (rawPrefValue(PreferKey.showBrightnessView) as? String)
+                ?: "0",
+            brightnessVwPos = compatDsString(PreferKey.readBrightnessControlPosition)
+                ?: when (val legacy = rawPrefValue(PreferKey.brightnessVwPos)) {
+                    is String -> legacy
+                    is Boolean -> if (legacy) "1" else "0"
+                    else -> null
+                }
+                ?: "1",
             readBrightness = compatDsValue(Keys.ReadBrightness, 100),
             brightnessAuto = compatDsValue(Keys.BrightnessAuto, true),
             useUnderline = compatDsValue(Keys.UseUnderline, false),
@@ -375,6 +407,8 @@ class ReadSettingsRepository(
             selectVibrator = compatDsValue(Keys.SelectVibrator, false),
             autoChangeSource = compatDsValue(Keys.AutoChangeSource, true),
             autoSuggestDayNight = compatDsValue(Keys.AutoSuggestDayNight, false),
+            readingAnchorEnabled = compatDsValue(Keys.ReadingAnchorEnabled, true),
+            readAloudDetachReminderEnabled = compatDsValue(Keys.ReadAloudDetachReminderEnabled, false),
             selectText = compatDsValue(Keys.SelectText, true),
             noAnimScrollPage = compatDsValue(Keys.NoAnimScrollPage, false),
             clickImgWay = compatDsValue(Keys.ClickImgWay, "2"),
@@ -383,10 +417,12 @@ class ReadSettingsRepository(
             expandTextMenu = compatDsValue(Keys.ExpandTextMenu, false),
             showSelectMenuIcon = compatDsValue(Keys.ShowSelectMenuIcon, true),
             textSelectMenuConfig = compatDsValue(Keys.TextSelectMenuConfig, ""),
+            lastMarkingStyle = compatDsValue(Keys.LastMarkingStyle, ""),
             showReadTitleAddition = compatDsValue(Keys.ShowReadTitleAddition, true),
             autoReadSpeed = compatDsValue(Keys.AutoReadSpeed, 10),
             systemTypefaces = compatDsValue(Keys.SystemTypefaces, 0),
             preDownloadNum = compatDsValue(Keys.PreDownloadNum, 10),
+            preDownloadNumPrev = compatDsValue(Keys.PreDownloadNumPrev, 0),
             prevKeys = compatDsValue(Keys.PrevKeys, ""),
             nextKeys = compatDsValue(Keys.NextKeys, ""),
             tocUiUseReplace = compatDsValue(Keys.TocUiUseReplace, false),
@@ -472,8 +508,6 @@ class ReadSettingsRepository(
         val TextBottomJustify = booleanPreferencesKey(PreferKey.textBottomJustify)
         val AdaptSpecialStyle = booleanPreferencesKey(PreferKey.adaptSpecialStyle)
         val UseZhLayout = booleanPreferencesKey(PreferKey.useZhLayout)
-        val ShowBrightnessView = stringPreferencesKey(PreferKey.showBrightnessView)
-        val BrightnessVwPos = stringPreferencesKey(PreferKey.brightnessVwPos)
         val ReadBrightness = intPreferencesKey(PreferKey.brightness)
         val BrightnessAuto = booleanPreferencesKey(PreferKey.brightnessAuto)
         val UseUnderline = booleanPreferencesKey(PreferKey.useUnderline)
@@ -494,6 +528,8 @@ class ReadSettingsRepository(
         val SelectVibrator = booleanPreferencesKey(PreferKey.selectVibrator)
         val AutoChangeSource = booleanPreferencesKey(PreferKey.autoChangeSource)
         val AutoSuggestDayNight = booleanPreferencesKey(PreferKey.autoSuggestDayNight)
+        val ReadingAnchorEnabled = booleanPreferencesKey(PreferKey.readingAnchorEnabled)
+        val ReadAloudDetachReminderEnabled = booleanPreferencesKey(PreferKey.readAloudDetachReminderEnabled)
         val SelectText = booleanPreferencesKey(PreferKey.selectText)
         val NoAnimScrollPage = booleanPreferencesKey(PreferKey.noAnimScrollPage)
         val ClickImgWay = stringPreferencesKey(PreferKey.clickImgWay)
@@ -502,10 +538,12 @@ class ReadSettingsRepository(
         val ExpandTextMenu = booleanPreferencesKey(PreferKey.expandTextMenu)
         val ShowSelectMenuIcon = booleanPreferencesKey(PreferKey.showSelectMenuIcon)
         val TextSelectMenuConfig = stringPreferencesKey(PreferKey.textSelectMenuConfig)
+        val LastMarkingStyle = stringPreferencesKey(PreferKey.lastMarkingStyle)
         val ShowReadTitleAddition = booleanPreferencesKey(PreferKey.showReadTitleAddition)
         val AutoReadSpeed = intPreferencesKey(PreferKey.autoReadSpeed)
         val SystemTypefaces = intPreferencesKey(PreferKey.systemTypefaces)
         val PreDownloadNum = intPreferencesKey(PreferKey.preDownloadNum)
+        val PreDownloadNumPrev = intPreferencesKey(PreferKey.preDownloadNumPrev)
         val PrevKeys = stringPreferencesKey(PreferKey.prevKeys)
         val NextKeys = stringPreferencesKey(PreferKey.nextKeys)
         val TocUiUseReplace = booleanPreferencesKey(PreferKey.tocUiUseReplace)
@@ -601,8 +639,8 @@ internal fun ReadSettings.toGatewayPrefMap(): Map<String, Any?> = mapOf(
     PreferKey.textBottomJustify to textBottomJustify,
     PreferKey.adaptSpecialStyle to adaptSpecialStyle,
     PreferKey.useZhLayout to useZhLayout,
-    PreferKey.showBrightnessView to showBrightnessView,
-    PreferKey.brightnessVwPos to brightnessVwPos,
+    PreferKey.readBrightnessMode to showBrightnessView,
+    PreferKey.readBrightnessControlPosition to brightnessVwPos,
     PreferKey.brightness to readBrightness,
     PreferKey.brightnessAuto to brightnessAuto,
     PreferKey.useUnderline to useUnderline,
@@ -623,6 +661,8 @@ internal fun ReadSettings.toGatewayPrefMap(): Map<String, Any?> = mapOf(
     PreferKey.selectVibrator to selectVibrator,
     PreferKey.autoChangeSource to autoChangeSource,
     PreferKey.autoSuggestDayNight to autoSuggestDayNight,
+    PreferKey.readingAnchorEnabled to readingAnchorEnabled,
+    PreferKey.readAloudDetachReminderEnabled to readAloudDetachReminderEnabled,
     PreferKey.selectText to selectText,
     PreferKey.noAnimScrollPage to noAnimScrollPage,
     PreferKey.clickImgWay to clickImgWay,
@@ -631,10 +671,12 @@ internal fun ReadSettings.toGatewayPrefMap(): Map<String, Any?> = mapOf(
     PreferKey.expandTextMenu to expandTextMenu,
     PreferKey.showSelectMenuIcon to showSelectMenuIcon,
     PreferKey.textSelectMenuConfig to textSelectMenuConfig,
+    PreferKey.lastMarkingStyle to lastMarkingStyle,
     PreferKey.showReadTitleAddition to showReadTitleAddition,
     PreferKey.autoReadSpeed to autoReadSpeed,
     PreferKey.systemTypefaces to systemTypefaces,
     PreferKey.preDownloadNum to preDownloadNum,
+    PreferKey.preDownloadNumPrev to preDownloadNumPrev,
     PreferKey.prevKeys to prevKeys,
     PreferKey.nextKeys to nextKeys,
     PreferKey.tocUiUseReplace to tocUiUseReplace,

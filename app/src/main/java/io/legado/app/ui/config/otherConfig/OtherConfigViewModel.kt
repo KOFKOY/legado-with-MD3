@@ -9,7 +9,6 @@ import io.legado.app.domain.gateway.AppLocaleGateway
 import io.legado.app.domain.gateway.DirectLinkRule
 import io.legado.app.domain.gateway.DirectLinkSettingsGateway
 import io.legado.app.domain.gateway.DownloadCacheSettingsGateway
-import io.legado.app.domain.gateway.LocalPasswordGateway
 import io.legado.app.domain.gateway.OtherConfigSystemGateway
 import io.legado.app.domain.gateway.OtherSettingsGateway
 import io.legado.app.domain.gateway.ReadAloudSettingsGateway
@@ -30,7 +29,6 @@ class OtherConfigViewModel(
     private val otherSettingsGateway: OtherSettingsGateway,
     private val downloadCacheSettingsGateway: DownloadCacheSettingsGateway,
     private val directLinkSettingsGateway: DirectLinkSettingsGateway,
-    private val localPasswordGateway: LocalPasswordGateway,
     private val systemGateway: OtherConfigSystemGateway,
     initialState: OtherConfigUiState = OtherConfigUiState(),
 ) : ViewModel() {
@@ -80,6 +78,9 @@ class OtherConfigViewModel(
 
     fun onIntent(intent: OtherConfigIntent) {
         when (intent) {
+            OtherConfigIntent.RefreshBatteryStatus -> _uiState.update {
+                it.copy(isBatteryIgnored = io.legado.app.utils.BatteryOptimizationUtils.isIgnoringBatteryOptimizations())
+            }
             is OtherConfigIntent.LanguageChanged -> appLocaleGateway.setLanguage(intent.value)
             is OtherConfigIntent.UpdateToVariantChanged ->
                 updateOtherSetting { it.copy(updateToVariant = intent.value) }
@@ -91,8 +92,6 @@ class OtherConfigViewModel(
                 updateOtherSetting { it.copy(autoRefresh = intent.value) }
             is OtherConfigIntent.DefaultToReadChanged ->
                 updateOtherSetting { it.copy(defaultToRead = intent.value) }
-            is OtherConfigIntent.FirebaseEnableChanged ->
-                updateOtherSetting { it.copy(firebaseEnable = intent.value) }
             is OtherConfigIntent.DefaultBookTreeUriChanged ->
                 updateOtherSetting { it.copy(defaultBookTreeUri = intent.value) }
             is OtherConfigIntent.AntiAliasChanged ->
@@ -113,6 +112,8 @@ class OtherConfigViewModel(
                 updateOtherSetting { it.copy(showMangaUi = intent.value) }
             is OtherConfigIntent.WebServiceWakeLockChanged ->
                 updateOtherSetting { it.copy(webServiceWakeLock = intent.value) }
+            is OtherConfigIntent.BlockSourceBrowserChanged ->
+                updateOtherSetting { it.copy(blockSourceBrowser = intent.value) }
             is OtherConfigIntent.SourceEditMaxLineChanged ->
                 updateOtherSetting { it.copy(sourceEditMaxLine = intent.value) }
             is OtherConfigIntent.WebPortChanged -> {
@@ -157,17 +158,14 @@ class OtherConfigViewModel(
             }
             OtherConfigIntent.DismissOverlay ->
                 _uiState.update { it.copy(activeOverlay = null) }
-            OtherConfigIntent.RequestNotificationPermission ->
-                _effects.tryEmit(OtherConfigEffect.RequestNotificationPermission)
-            OtherConfigIntent.RequestBatteryPermission ->
-                _effects.tryEmit(OtherConfigEffect.RequestBatteryPermission)
+
             OtherConfigIntent.RequestSystemDirectory ->
                 _effects.tryEmit(OtherConfigEffect.OpenSystemDirectory)
             OtherConfigIntent.ConfirmClearWebViewData -> {
                 _uiState.update { it.copy(activeOverlay = null) }
                 clearWebViewData()
             }
-            is OtherConfigIntent.SaveLocalPassword -> saveLocalPassword(intent.password)
+
             is OtherConfigIntent.MessageShown -> {
                 _uiState.update { state ->
                     state.copy(
@@ -230,14 +228,6 @@ class OtherConfigViewModel(
                     AppLog.put("清除 WebView 数据失败", it)
                     showMessage(R.string.clear_webview_data_failed)
                 }
-        }
-    }
-
-    private fun saveLocalPassword(password: String) {
-        viewModelScope.launch {
-            runCatching { localPasswordGateway.setPassword(password) }
-                .onSuccess { _uiState.update { it.copy(activeOverlay = null) } }
-                .onFailure { showMessage(it.localizedMessage ?: "设置失败") }
         }
     }
 
@@ -358,7 +348,7 @@ private fun OtherSettings.toUiState(current: OtherConfigUiState): OtherConfigUiS
         webServiceAutoStart = webServiceAutoStart,
         autoRefresh = autoRefresh,
         defaultToRead = defaultToRead,
-        firebaseEnable = firebaseEnable,
+
         defaultBookTreeUri = defaultBookTreeUri,
         antiAlias = antiAlias,
         replaceEnableDefault = replaceEnableDefault,
@@ -366,9 +356,11 @@ private fun OtherSettings.toUiState(current: OtherConfigUiState): OtherConfigUiS
         showAddToShelfAlert = showAddToShelfAlert,
         showMangaUi = showMangaUi,
         webServiceWakeLock = webServiceWakeLock,
+        blockSourceBrowser = blockSourceBrowser,
         sourceEditMaxLine = sourceEditMaxLine,
         webPort = webPort,
         processText = processText,
         recordLog = recordLog,
         recordHeapDump = recordHeapDump,
+        isBatteryIgnored = io.legado.app.utils.BatteryOptimizationUtils.isIgnoringBatteryOptimizations(),
     )

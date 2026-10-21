@@ -459,19 +459,43 @@ private fun ReaderSettingsContent(
             )
         }
     }
-    SettingSlider(
-        stringResource(R.string.manga_reader_preload_pages),
-        settings.preDownloadCount,
-        0..10
+    SettingSwitch(
+        stringResource(R.string.manga_reader_preload_chapter),
+        settings.preDownloadCount > 0,
     ) {
-        onIntent(MangaReaderIntent.UpdateSetting(MangaReaderSettingKey.PRE_DOWNLOAD, it))
+        onIntent(
+            MangaReaderIntent.UpdateSetting(
+                MangaReaderSettingKey.PRE_DOWNLOAD,
+                if (it) 10 else 0
+            )
+        )
     }
-    SettingSlider(
-        stringResource(R.string.manga_reader_prefetch_chapters),
-        settings.chapterPrefetchCount,
-        0..3,
+    SettingSwitch(
+        stringResource(R.string.manga_reader_auto_offline_cache),
+        settings.autoOfflineCache,
     ) {
-        onIntent(MangaReaderIntent.UpdateSetting(MangaReaderSettingKey.CHAPTER_PREFETCH, it))
+        onIntent(
+            MangaReaderIntent.UpdateSetting(
+                MangaReaderSettingKey.AUTO_OFFLINE_CACHE,
+                it.intValue,
+            )
+        )
+    }
+    if (settings.autoOfflineCache) {
+        SettingSlider(
+            stringResource(R.string.pre_download),
+            settings.chapterPrefetchCount,
+            0..100,
+        ) {
+            onIntent(MangaReaderIntent.UpdateSetting(MangaReaderSettingKey.CHAPTER_PREFETCH, it))
+        }
+        SettingSlider(
+            stringResource(R.string.pre_download_prev),
+            settings.previousChapterPrefetchCount,
+            0..100,
+        ) {
+            onIntent(MangaReaderIntent.UpdateSetting(MangaReaderSettingKey.CHAPTER_PREFETCH_PREV, it))
+        }
     }
     SettingSwitch(stringResource(R.string.manga_reader_pinch_zoom), !settings.disableScale) {
         onIntent(

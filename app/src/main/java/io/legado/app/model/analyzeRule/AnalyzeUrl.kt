@@ -13,11 +13,11 @@ import io.legado.app.constant.AppPattern
 import io.legado.app.data.entities.BaseSource
 import io.legado.app.data.entities.Book
 import io.legado.app.data.entities.BookChapter
+import io.legado.app.domain.gateway.DownloadCacheSettingsGateway
 import io.legado.app.exception.NoStackTraceException
 import io.legado.app.help.CacheManager
 import io.legado.app.help.ConcurrentRateLimiter
 import io.legado.app.help.JsExtensions
-import io.legado.app.help.config.AppConfig
 import io.legado.app.help.crypto.toHexString
 import io.legado.app.help.exoplayer.ExoPlayerHelper
 import io.legado.app.help.glide.GlideHeaders
@@ -50,6 +50,7 @@ import io.legado.app.utils.isXml
 import io.legado.app.utils.parseIpsFromString
 import io.legado.app.utils.stackTraceStr
 import kotlinx.coroutines.runBlocking
+import okhttp3.Call
 import okhttp3.Dns
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
@@ -57,6 +58,14 @@ import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
 import okhttp3.Response
 import okhttp3.ResponseBody.Companion.toResponseBody
+import org.koin.core.context.GlobalContext
+import org.mozilla.javascript.CompilerEnvirons
+import org.mozilla.javascript.Context
+import org.mozilla.javascript.EvaluatorException
+import org.mozilla.javascript.Parser
+import org.mozilla.javascript.ast.Name
+import org.mozilla.javascript.ast.ObjectProperty
+import org.mozilla.javascript.ast.PropertyGet
 import java.io.ByteArrayInputStream
 import java.io.InputStream
 import java.net.URLEncoder
@@ -81,6 +90,14 @@ class AnalyzeUrl(
     private val page: Int? = null,
     private val speakText: String? = null,
     private val speakSpeed: Int? = null,
+    /**
+     * 当前片段使用的音色，供支持原生发言人目录的朗读源在 URL 里拼参数，
+     * 例如 `?v={{currentToneID}}`。默认空串，不带目录的源不受影响。
+     */
+    private val currentToneID: String = "",
+    private val currentSpeakerName: String = "",
+    private val currentEmotionName: String = "",
+    private val currentEmotionTag: String = "",
     private var baseUrl: String = "",
     private val source: BaseSource? = null,
     private val ruleData: RuleDataInterface? = null,
@@ -118,6 +135,7 @@ class AnalyzeUrl(
     private val domain: String
     private var webViewDelayTime: Long = 0
     private val concurrentRateLimiter = ConcurrentRateLimiter(source)
+    private val cacheSettingsGateway get() = GlobalContext.get().get<DownloadCacheSettingsGateway>()
 
     // 服务器ID
     var serverID: Long? = null
@@ -128,7 +146,7 @@ class AnalyzeUrl(
         val urlMatch = paramPattern.find(baseUrl)
         if (urlMatch != null) baseUrl = baseUrl.substring(0, urlMatch.range.first)
         (headerMapF ?: runScriptWithContext(coroutineContext) {
-            source?.getHeaderMap(AppConfig.userAgent, hasLoginHeader)
+            source?.getHeaderMap(cacheSettingsGateway.currentSettings.userAgent, hasLoginHeader)
         })?.let {
             headerMap.putAll(it)
             if (it.containsKey("proxy")) {
@@ -368,6 +386,10 @@ class AnalyzeUrl(
             bindings["key"] = key
             bindings["speakText"] = speakText
             bindings["speakSpeed"] = speakSpeed
+            bindings["currentToneID"] = currentToneID
+            bindings["currentSpeakerName"] = currentSpeakerName
+            bindings["currentEmotionName"] = currentEmotionName
+            bindings["currentEmotionTag"] = currentEmotionTag
             bindings["book"] = ruleData as? Book
             bindings["source"] = source
             bindings["result"] = result
@@ -545,10 +567,13 @@ class AnalyzeUrl(
     /**
      * 访问网站,返回Response
      */
-    suspend fun getResponseAwait(): Response {
+    suspend fun getResponseAwait(): Response = getResponseAwait { }
+
+    /** 将实际 Call 的取消能力交给需要继续读取响应体的调用方。 */
+    suspend fun getResponseAwait(onCall: (Call) -> Unit): Response {
         concurrentRateLimiter.withLimit {
             setCookie()
-            val response = getClient().newCallResponse(retry) {
+            val response = getClient().newCallResponse(retry, onCall) {
                 addHeaders(headerMap)
                 when (method) {
                     RequestMethod.POST -> {
@@ -599,7 +624,7 @@ class AnalyzeUrl(
         if (readTimeout == null && callTimeout == null && dnsIp == null) {
             return client
         }
-        if (AppConfig.isCronet && dnsIp != null) {
+        if (cacheSettingsGateway.currentSettings.cronetEnabled && dnsIp != null) {
             customIp[urlNoQuery] = dnsIp!!
         }
         return client.newBuilder().run {
@@ -755,7 +780,7 @@ class AnalyzeUrl(
     }
 
     fun getUserAgent(): String {
-        return headerMap.get(UA_NAME, true) ?: AppConfig.userAgent
+        return headerMap.get(UA_NAME, true) ?: cacheSettingsGateway.currentSettings.userAgent
     }
 
     fun isPost(): Boolean {
@@ -773,6 +798,47 @@ class AnalyzeUrl(
     companion object {
         val paramPattern: Regex = Regex("\\s*,\\s*(?=\\{)")
         private val pagePattern = Regex("<(.*?)>")
+
+        /** Inspect the supported URL rule syntax without executing source JavaScript. */
+        fun supportsPageSelection(rule: String?): Boolean {
+            if (rule.isNullOrBlank()) return false
+            var usesPage = false
+            val withoutScripts = AppPattern.JS_PATTERN.replace(rule) { match ->
+                val script = match.groupValues[2].ifEmpty { match.groupValues[1] }
+                usesPage = usesPage || referencesPage(script)
+                ""
+            }
+            val withoutExpressions = RuleAnalyzer(withoutScripts).innerRule("{{", "}}") {
+                usesPage = usesPage || referencesPage(it)
+                ""
+            }
+            return usesPage || pagePattern.findAll(withoutExpressions).any {
+                it.groupValues[1].contains(',')
+            }
+        }
+
+        private fun referencesPage(script: String): Boolean {
+            val environment = CompilerEnvirons().apply {
+                languageVersion = Context.VERSION_ES6
+            }
+            val root = try {
+                Parser(environment).parse(script, "page-selection", 1)
+            } catch (_: EvaluatorException) {
+                return false
+            }
+            var found = false
+            root.visit { node ->
+                if (node is Name && node.identifier == "page" && node.definingScope == null) {
+                    val parent = node.parent
+                    val isProperty = (parent is PropertyGet && parent.property === node) ||
+                        (parent is ObjectProperty && parent.left === node)
+                    if (!isProperty) found = true
+                }
+                !found
+            }
+            return found
+        }
+
         private const val QUERY_HEX_UPPER = "0123456789ABCDEF"
         private val queryEncoderSafeChars: BooleanArray = BooleanArray(128).apply {
             for (c in "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_.-~!$%&()*+,/:;=?@[\\]^`{|}") {
